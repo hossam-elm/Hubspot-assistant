@@ -1,6 +1,8 @@
 from openai import OpenAI
 from auth import get_google_sheet
 from searchserpapi import serpapi_search
+from searchgoogle import google_cse_search
+from searchddg import duckduckgo_grouped_search
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -20,7 +22,8 @@ client = OpenAI()
 
 def get_company_profile(company_name):
     try:
-        web_context = serpapi_search(company_name, serpapi_key)
+        web_context = google_cse_search(company_name, google_key, google_cse_id)
+        #web_context = duckduckgo_grouped_search(company_name)
         if not web_context:
             web_context = "Aucune information trouvée sur le web."
         else:
@@ -31,65 +34,73 @@ def get_company_profile(company_name):
         web_context = "Erreur lors de la récupération des informations web."
 
     prompt=f"""
-            Please provide a detailed company profile in the following format for the company named {company_name} in french, use your informations and this web context: {web_context}:
+            Tu réponds en français, Tu es un analyste B2B senior chez Atelier Box, expert en cadeaux d’entreprise personnalisés, welcome packs, textiles premium, goodies écoresponsables, et e-shops en interne.
 
-            Company Name: [Company Name]
+            Ta mission : générer une fiche compte commerciale structurée et exploitable avant un call avec un prospect en utilisant ce context:{web_context}. Le but est d’identifier des opportunités concrètes de vente et les bons interlocuteurs.
 
-            Sector: [Industry/Sector Information]
+            T'es libre à ajouter des informations pertinentes
+            À partir du nom d’une entreprise, recherche des informations fiables et formate les résultats exactement comme suit, avec des sections claires, des emojis, et des puces.
 
-            Employees: [Number of Employees and Locations]
+            🏢 FICHE COMPTE – {company_name}
+            🔹 Secteur & Modèle économique
+            • Secteur d’activité (ex : FinTech, SaaS, Retail…)
+            • Modèle économique (ex : abonnement B2B, marketplace…)
 
-            Clients / Revenue: [Number of Clients and Estimated Revenue]
+            👥 Taille de l’entreprise
+            • Nombre de collaborateurs (total + France si dispo)
+            • Évolution : hypercroissance / stable / décroissance
 
-            Geographic Presence: [List of Countries/Regions]
+            💰 Clients / Chiffre d'affaires
+            • Nombre estimé de clients
+            • Chiffre d’affaires annuel estimé
 
-            CSE: [Indicate if there is a CSE (Comité Social et Économique)]
+            🌍 Présence géographique
+            • Siège social
+            • Autres bureaux clés (villes + pays)
 
-            Pitch: [Company’s current business needs and areas where it might require support or partnerships. Focus on specific projects, products, or services they are interested in (e.g.,corporate gifting, e-commerce platforms, onboarding solutions).]
+            🏛️ CSE
+            • Présence d’un CSE ? (Oui / Non / À confirmer)
 
-            Opportunities pour Atelierbox: [List of identified opportunities in terms of projects, needs, events, or ongoing recruitment for atelierbox services.]
+            🔥 Actualités & signaux business
+            • Levée de fonds / rebranding / lancement de bureaux
+            • Recrutement actif (ex : “+60 postes ouverts”)
+            • Expansion produit ou géographique
 
-            Events: [List of upcoming events, conferences, or trade shows they are participating in or organizing, with dates and locations.]
-            Recent News: [Recent news or developments related to the company, including any new product launches, partnerships, or expansions.]
+            🎯 Opportunités Atelier Box
+            Liste précise des besoins qu’Atelier Box peut couvrir :
+            • Welcome kits onboarding (fréquence ?)
+            • Textiles internes (hoodies, polos, vestes équipes sales/tech)
+            • Goodies clients ou packs démo
+            • Coffrets VIP, speakers, direction
+            • Boxes culture interne (anniversaires, milestones, séminaires)
+            • E-shop marque blanche (préciser si multi-pays)
+            • Un petits briefs pour nos commercial avec les points clés à mettre en avant
 
-            Key Contacts: [List of contacts with names and roles at the company from linkedin]
+            📅 Calendrier opportunités 2025
+            • Événements internes ou publics avec dates précises, tu prends tous les dates que tu trouves
+            (ex : séminaires, lancements, salons)
 
-            Score: [Provide an overall score to indicate the priority or potential of the account (from 0 to 100).]
+            👥 Interlocuteurs clés à contacter
+            • Nom + fonction (uniquement : Marketing, RH, Office, Events, CSE, Talent…)+ Lien Linkedin
+            • Priorité aux profils décisionnaires ou influenceurs
+            • Pas de commerciaux, pas de profils trop juniors
+            • C'est très important de donner des noms et des liens Linkedin, pas seulement des fonctions
+            • Si pas d’infos, indiquer “Aucun contact trouvé”
 
-            Ensure the output includes specific details about the company’s operations, needs, and potential business opportunities. The style should be professional, concise, and clear with proper organization. 
+            ✅ Score Atelier Box (sur 100)
+            • Note sur 100 en fonction : potentiel gifting, international, volume, culture événementielle, RSE
+            • Justification en une phrase claire
 
-            Here is an example of the output:
-            Company Name: **Comexposium**
-            Sector:
-            Événementiel / Organisation de salons et conférences professionnels
-            Employees:
-            Environ 800 employés répartis principalement au siège à Paris (France), avec des bureaux et collaborateurs dans plusieurs pays stratégiques.
-            Clients / Revenue:
-            Plus de 45 000 clients exposants chaque année, 3,5 millions de visiteurs sur leurs événements. Chiffre d'affaires estimé à plus de 350 millions d'euros annuellement.
-            Geographic Presence:
-            Présence internationale : France (siège), Europe (Espagne, Italie, Allemagne, Royaume-Uni), Asie (Chine, Indonesia, Singapour), Amériques (États-Unis, Canada, Brésil), Moyen-Orient.
-            CSE:
-            Oui – Un Comité Social et Économique actif, particulièrement pour le siège parisien.
-            Pitch:
-            Comexposium organise de grands salons et expositions (SIAL, Paris Games Week, SIMA...) nécessitant une gestion logistique pointue et des solutions innovantes pour renforcer l'engagement des exposants, visiteurs et partenaires. Ils recherchent régulièrement des options de cadeaux d’affaires (swag), des solutions d’accueil et d’onboarding pour les nouveaux partenaires et clients, ainsi que des plateformes de e-commerce pour le merchandising événementiel. Avec la reprise de l’activité événementielle, ils sont particulièrement attentifs à la différenciation de leur offre par le biais de cadeaux d’entreprise originaux et responsables.
-            Opportunities:
-            - Préparation de grands événements récurrents en 2024–2025 (SIAL, Paris Retail Week, Salon du Cheval, etc.) : opportunités de coffrets cadeaux, kits de bienvenue, cadeaux VIP.
-            - Besoin croissant de cadeaux personnalisés et produits locaux ou écoresponsables pour les exposants et visiteurs premium.
-            - Sensibilisation croissante au bien-être salarié, notamment via des campagnes internes pilotées par le CSE (cadeaux de fin d’année, récompenses).
-            - Recrutements importants dans les équipes salons/marketing en 2024 – intégration de nouveaux collaborateurs à soutenir avec des welcome packs.
-            - Intérêt possible pour des solutions digitales de gestion de cadeaux ou de boutique interne.
-            Key Contacts:
-            - Isabelle Charlier, Chief Human Resources Officer
-            - Sandra Fournier, Head of Procurement
-            - Olivier Ferraton, Directeur Général
-            - Julie Rivet, Marketing & Partnerships Director
-            Score: **86 / 100**
-            (Potentiel élevé en raison du volume d’événements, de la récurrence des besoins cadeaux, de la présence du CSE et de l’orientation vers l’innovation et la RSE.)   
+            🎯 Ne donne que des informations concrètes et utiles à un commercial, ne donne pas des fausses informations. Pas de phrases vagues, pas de blabla.
+
+            Entreprise à analyser : {company_name}            
+
+
             """
     completion = client.chat.completions.create(
-    model="gpt-4o",
+    model="o3-mini",
     messages=[
-        {"role": "developer", "content": "You are a company profile generators that helps my company 'atelierbox', specialist in corporate gifts, to gather information about companies, we offer mainly personnalized high quality products and textiles, giftboxes, onboarding boxes,ecommerce platforms for their clients or employees, and  everything related, you are professional, concise, and clear with proper organization."},
+        {"role": "developer", "content": "You are a company profile generators that helps my company 'atelierbox', specialist in corporate gifts, to gather information about companies, we offer mainly personnalized high quality products and textiles, giftboxes, onboarding boxes,ecommerce platforms for their clients or employees, and  everything related, you are professional, concise, and clear with proper organization here's an example of the output I want you to generate: "},
         {"role": "user", "content": prompt}
     ]
     )
