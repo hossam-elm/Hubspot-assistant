@@ -1,6 +1,7 @@
 '''
 search_helper.py
-Production-hardened Google CSE helper with caching, scraping, and embeddings.
+Production-hardened Google CSE helper with unified caching in .cache/reports.db,
+scraping, and embeddings.
 Dependencies:
     pip install requests httpx[http2] trafilatura sentence-transformers tenacity
 '''
@@ -21,6 +22,7 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 from trafilatura import extract
 from sentence_transformers import SentenceTransformer
+import hashlib
 
 # ─── Logging Configuration ────────────────────────────────────────────────
 logging.basicConfig(
@@ -30,7 +32,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Constants ───────────────────────────────────────────────────────────
-CACHE_PATH = Path(__file__).with_name("search_cache.sqlite3")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent  
+CACHE_DIR    = PROJECT_ROOT / ".cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DB     = CACHE_DIR / "reports.db"
 CACHE_TTL_SECS = 24 * 3600  # 1 day
 CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
 HEADERS = {
@@ -45,19 +50,23 @@ BLOCKED_DOMAINS = {"linkedin.com"}
 QUERY_TEMPLATES: List[str] = [
     "{name} recrutement OR 'recrute' OR 'offres d’emploi' OR 'jobs'",
     "{name} 'nouveau bureau' OR 'ouvre un bureau' OR 'implantation' OR 'locaux'",
-    "{name} événement OR salon OR séminaire OR conférence OR webinaire",
+    "{name} événement OR salon OR séminaire OR conférence OR webinaire'",
     "{name} 'rebranding' OR 'nouvelle identité' OR 'nouvelle charte graphique'",
-    "{name} 'levée de fonds' OR 'tour de table' OR investissement OR financement",
+    "{name} 'levée de fonds' OR 'tour de table' OR investissement OR financement'",
     "{name} actualités OR annonce OR nouveauté OR 'dernier communiqué'",
     "{name} chiffre d’affaires OR secteur OR clients OR 'cse'",
     "{name} site:linkedin.com/in intext:\"CSE\" OR \"Office manager\" OR \"Happiness\" OR \"Communication\" OR \"People\" OR \"Talent\" OR \"RH\"",
 ]
 
-# ─── SQLite Cache Abstraction (Thread-safe) ───────────────────────────────
+# ─── Ensure folder & DB exist ─────────────────────────────────────────────
+CACHE_DB.parent.mkdir(parents=True, exist_ok=True)
+
+# ─── SQLite Cache Abstraction (Thread-safe, WAL mode) ────────────────────
 class SQLiteCache:
     def __init__(self, path: Path, table: str):
         self.lock = threading.Lock()
         self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
         self.table = table
         self.conn.execute(f"""
             CREATE TABLE IF NOT EXISTS {table} (
@@ -84,10 +93,10 @@ class SQLiteCache:
             )
             self.conn.commit()
 
-# Instantiate caches
-search_cache = SQLiteCache(CACHE_PATH, "search_cache")
-scrape_cache = SQLiteCache(CACHE_PATH, "scrape_cache")
-embed_cache  = SQLiteCache(CACHE_PATH, "embed_cache")
+# Instantiate caches (all in the same DB file)
+search_cache = SQLiteCache(CACHE_DB, "search_cache")
+scrape_cache = SQLiteCache(CACHE_DB, "scrape_cache")
+embed_cache  = SQLiteCache(CACHE_DB, "embed_cache")
 
 # ─── HTTP Session & Async Client (Connection reuse) ───────────────────────
 session = requests.Session()
@@ -101,7 +110,6 @@ def get_async_client() -> httpx.AsyncClient:
     return async_client
 
 # ─── Domain Helper ────────────────────────────────────────────────────────
-
 def _domain(url: str) -> str:
     host = urlparse(url).hostname or ""
     return host.lower().lstrip("www.")
@@ -112,10 +120,13 @@ _model = SentenceTransformer("all-MiniLM-L6-v2")
 def embed_text(text: str) -> list[float]:
     return _model.encode(text, convert_to_numpy=False).tolist()
 
+# ─── Stable Hash for Embedding Cache Keys ────────────────────────────────
+def stable_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 # ─── CSE Wrapper w/ Retries ───────────────────────────────────────────────
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
 def _cse_call(params: Dict) -> List[Dict]:
-    """Call Google CSE with retries and log errors."""
     resp = session.get(CSE_ENDPOINT, params=params, timeout=15)
     if resp.status_code == 200:
         return resp.json().get("items", [])
@@ -125,9 +136,9 @@ def _cse_call(params: Dict) -> List[Dict]:
         error = resp.text
     logger.error(f"CSE {resp.status_code}: %s", error)
     resp.raise_for_status()
-    return []  # unreachable if raise_for_status() fails
+    return []
 
-# ─── Google CSE Query Runner ────────────────────────────────────────────────
+# ─── Google CSE Query Runner ───────────────────────────────────────────────
 def run_queries(
     company_name: str,
     api_key: str,
@@ -135,25 +146,23 @@ def run_queries(
     num_results: int = 10,
     recent_years: int | None = None,
 ) -> List[Dict]:
-    """Run templated queries, cache results, and dedupe URLs."""
     queries = [tpl.format(name=company_name) for tpl in QUERY_TEMPLATES]
     final_items: List[Dict] = []
     seen_urls = set()
 
     for q in queries:
-        hits = search_cache.get(q)
+        cache_key = f"{company_name}│{q}"
+        hits = search_cache.get(cache_key)
         if hits is None:
             params = {"key": api_key, "cx": cx, "q": q, "num": num_results, "gl": "fr"}
             if recent_years:
-                year = datetime.now(timezone.utc).year
-                years = ",".join(f"y{y}" for y in range(year, year - recent_years, -1))
-                params["dateRestrict"] = years
+                params["dateRestrict"] = f"y{recent_years}"
             try:
                 hits = _cse_call(params)
             except RetryError as e:
                 logger.error("CSE call failed after retries: %s", e)
                 hits = []
-            search_cache.set(q, hits)
+            search_cache.set(cache_key, hits)
 
         for it in hits:
             url = it.get("link")
@@ -195,8 +204,7 @@ async def scrape_urls(pairs: List[tuple[str, str]]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for url, text in results:
         out[url] = text
-        # cache embedding by hash key avoidance
-        key = str(hash(text))
+        key = stable_hash(text)
         if embed_cache.get(key) is None:
             vec = embed_text(text)
             embed_cache.set(key, vec)
@@ -220,7 +228,28 @@ def google_cse_search(
 
     for it in items:
         it["content"] = article_map.get(it["link"])
+        # 2b. Drop any results that don't even mention the company name
+    needle = company_name.lower()
+    filtered = []
+    for it in items:
+        link    = (it.get("link")    or "").lower()
+        title   = (it.get("title")   or "").lower()
+        snippet = (it.get("snippet") or "").lower()
+        content = (it.get("content") or "").lower()
 
+        # Always keep LinkedIn pages
+        if "linkedin.com" in link:
+            filtered.append(it)
+            continue
+
+        # Otherwise require at least one field to contain the company name
+        if (needle in title or
+            needle in snippet or
+            needle in link or
+            needle in content):
+            filtered.append(it)
+
+    items = filtered
     # 3. Return structured or blob
     if structured:
         return items
@@ -228,23 +257,3 @@ def google_cse_search(
     return "\n\n".join(
         f"🔹 {it['title']}\n{it['snippet']}\n🔗 {it['link']}" for it in items
     )
-
-
-#test
-# import os
-# google_key = os.getenv('google_key')
-# google_cse_id = os.getenv('google_cse_id')
-
-
-# results = google_cse_search(
-#     "Agicap",
-#     api_key=google_key,
-#     cx=google_cse_id,
-#     structured=True
-# )
-
-# # write to disk
-# with open("agicap_results.txt", "w", encoding="utf-8") as f:
-#     json.dump(results, f, ensure_ascii=False, indent=2)
-
-# print("Saved → agicap_results.txt")
