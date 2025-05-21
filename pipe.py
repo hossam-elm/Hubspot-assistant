@@ -60,8 +60,10 @@ def setup_logger(company: str) -> logging.Logger:
         logger.addHandler(fh)
     return logger
 
+
 def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
 
 def chunk_text(text: str, max_words: int = MAX_CHUNK_WORDS) -> List[str]:
     sentences = re.split(r'(?<=[.!?])\s+', text)
@@ -77,11 +79,14 @@ def chunk_text(text: str, max_words: int = MAX_CHUNK_WORDS) -> List[str]:
         chunks.append(current.strip())
     return chunks
 
+
+# Split long texts into embedding-safe pieces:
 def embed_clip_or_split(text: str, max_tokens: int = MAX_EMBED_TOKENS) -> List[str]:
     token_ids = ENC.encode(text)
     if len(token_ids) <= max_tokens:
         return [text]
     return [ENC.decode(token_ids[i:i+max_tokens]) for i in range(0, len(token_ids), max_tokens)]
+
 
 def get_embeddings(texts: List[str]) -> List[List[float]]:
     safe_texts: List[str] = []
@@ -93,6 +98,7 @@ def get_embeddings(texts: List[str]) -> List[List[float]]:
         resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
         all_embs.extend(d.embedding for d in resp.data)
     return all_embs
+
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -112,15 +118,25 @@ def init_db() -> sqlite3.Connection:
     conn.commit()
     return conn
 
-# ─── REPORT FUNCTION ───────────────────────────────────────────────────────
 
-def report(company_name: str) -> List[Dict]:
+def parse_linkedin_title(title: str) -> Dict[str, str]:
+    parts = [p.strip() for p in title.split(" - ")]
+    if len(parts) == 2:
+        name, company = parts
+        return {"name": name, "job": "", "company": company}
+    if len(parts) == 3:
+        name, job, company = parts
+        return {"name": name, "job": job, "company": company}
+    return {"name": title, "job": "", "company": ""}
+
+
+def report(company_name: str) -> Dict[str, List[Dict]]:
+    company_name = company_name.lower()
     logger = setup_logger(company_name)
     conn = init_db()
     c = conn.cursor()
 
-    # 1) Fetch (or load from google_cse_search's cache) raw hits:
-    logger.info("Fetching raw results for %s via google_cse_search()", company_name)
+    # 1) Fetch raw results
     raw = google_cse_search(
         company_name,
         api_key=os.getenv('google_key'),
@@ -129,79 +145,65 @@ def report(company_name: str) -> List[Dict]:
     )
     results = raw if isinstance(raw, (list, tuple)) else json.loads(raw)
 
-    # 2) Load existing chunks for this company:
-    c.execute("SELECT chunk_id, link, title, chunk, is_linkedin, matched_queries "
-              "FROM chunks WHERE company = ?", (company_name,))
-    saved = c.fetchall()
+    # 2) Clear & re-chunk all current results
+    c.execute("DELETE FROM chunks WHERE company = ?", (company_name,))
+    conn.commit()
+    all_chunks = []
+    linkedin_profile_chunks = []
+    idx = 0
 
-    if saved:
-        logger.info("Loaded %d cached chunks for %s", len(saved), company_name)
-        all_chunks = [
-            dict(chunk_id=r[0], link=r[1], title=r[2], chunk=r[3])
-            for r in saved if not r[4]
-        ]
-        linkedin_chunks = [
-            dict(chunk_id=r[0], link=r[1], title=r[2], chunk=r[3], matched_queries=r[5].split(','))
-            for r in saved if r[4]
-        ]
+    for entry in results:
+        link    = normalize_whitespace(entry.get('link',''))
+        title   = normalize_whitespace(entry.get('title',''))
+        content = normalize_whitespace(entry.get('content') or entry['snippet'])
+        for segment in chunk_text(content):
+            idx += 1
+            is_li      = 'linkedin.com/in' in link
+            is_event   = any(k in segment.lower() for k in ("événement","event"))
+            is_money   = any(k in segment.lower() for k in ("euros","€","dollars","$"))
+            is_webinar = "webinar" in segment.lower()
 
-    else:
-        # 3) Chunk and persist every snippet into `chunks` table:
-        logger.info("No cached chunks: chunking %d results for %s", len(results), company_name)
-        all_chunks = []
-        linkedin_chunks = []
-        idx = 0
-        for entry in results:
-            link    = normalize_whitespace(entry.get('link',''))
-            title   = normalize_whitespace(entry.get('title',''))
-            content = normalize_whitespace(entry.get('content') or entry['snippet'])
-            for segment in chunk_text(content):
-                idx += 1
-                is_li     = 'linkedin.com/in' in link
-                is_event  = any(k in segment.lower() for k in ("événement", "event"))
-                is_money  = any(k in segment.lower() for k in ("euros", "€", "dollars", "$"))
-                is_webinar= "webinar" in segment.lower()
-                c.execute("""
-                  INSERT OR IGNORE INTO chunks
-                    (company, chunk_id, link, title, chunk, is_linkedin, matched_queries)
-                  VALUES (?,?,?,?,?,?,?)
-                """, (company_name, idx, link, title, segment, int(is_li), ''))
-                item = dict(chunk_id=idx, link=link, title=title, chunk=segment)
-                if is_li or is_event or is_money or is_webinar:
-                    linkedin_chunks.append({**item, 'matched_queries': []})
-                else:
-                    all_chunks.append(item)
-        conn.commit()
-        logger.info("Inserted %d new chunks for %s", idx, company_name)
+            c.execute(
+                "INSERT OR IGNORE INTO chunks"
+                " (company,chunk_id,link,title,chunk,is_linkedin,matched_queries)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (company_name, idx, link, title, segment, int(is_li), '')
+            )
+            item = {"chunk_id": idx, "link": link, "title": title, "chunk": segment}
+            if is_li:
+                # save raw LinkedIn segment for separate parsing
+                parsed = parse_linkedin_title(title)
+                linkedin_profile_chunks.append({**parsed, **item})
+            elif is_event or is_webinar or is_money:
+                all_chunks.append(item)
+            else:
+                # optionally skip storing non-relevant
+                all_chunks.append(item)
+    conn.commit()
 
-    # 4) Compute embeddings & semantic matches on non‐LinkedIn chunks
-    texts     = [c['chunk'] for c in all_chunks]
-    if texts:
-        chunk_embs = get_embeddings(texts)
+    # 3) Embed & filter semantic queries on non-linkedin
+    text_list = [c['chunk'] for c in all_chunks]
+    report_semantic = []
+    if text_list:
+        chunk_embs = get_embeddings(text_list)
         query_embs = get_embeddings(SEMANTIC_QUERIES)
         sims       = cosine_similarity(chunk_embs, query_embs)
-
-        report_items = []
-        seen_ids     = set()
-        for (item, scores) in zip(all_chunks, sims):
-            matched = [q for q,s in zip(SEMANTIC_QUERIES, scores) if s >= SIM_THRESHOLD]
+        for item, scores in zip(all_chunks, sims):
+            matched = [q for q,s in zip(SEMANTIC_QUERIES,scores) if s >= SIM_THRESHOLD]
             if matched:
-                report_items.append({**item, 'matched_queries': matched})
-                seen_ids.add(item['chunk_id'])
-                c.execute("""
-                  UPDATE chunks
-                     SET matched_queries=?
-                   WHERE company=? AND chunk_id=?
-                """, (','.join(matched), company_name, item['chunk_id']))
-        # include any LinkedIn chunks not already in report
-        for li in linkedin_chunks:
-            if li['chunk_id'] not in seen_ids:
-                report_items.append(li)
+                report_semantic.append({**item, 'matched_queries': matched})
+                c.execute(
+                    "UPDATE chunks SET matched_queries=? WHERE company=? AND chunk_id=?",
+                    (','.join(matched), company_name, item['chunk_id'])
+                )
         conn.commit()
 
-    else:
-        report_items = linkedin_chunks  # only LinkedIn or pre‐tagged chunks
-
     conn.close()
-    logger.info("Report ready: %d items for %s", len(report_items), company_name)
-    return report_items
+    logger.info("Report ready: %d semantic, %d linkedin segments",
+                len(report_semantic), len(linkedin_profile_chunks))
+
+    return {
+        'semantic_items': report_semantic,
+        'linkedin_profiles': linkedin_profile_chunks
+    }
+
