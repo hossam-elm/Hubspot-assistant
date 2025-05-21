@@ -1,11 +1,11 @@
 from openai import OpenAI
-from embed import filter_by_embedding      # new
-from guard import clip_or_split             # new (your tiktoken helper)
-from gapfill         import gap_fill_once             # new
-from auth import get_google_sheet
-from searchserpapi import serpapi_search
-from searchgoogle import google_cse_search
-from searchddg import duckduckgo_grouped_search
+from utils.embed import filter_by_embedding      # new
+from utils.guard import clip_or_split             # new (your tiktoken helper)
+from utils.gapfill         import gap_fill_once             # new
+from auths.auth import get_google_sheet
+from searchfuncs.searchserpapi import serpapi_search
+from searchfuncs.searchgoogle import google_cse_search
+from searchfuncs.searchddg import duckduckgo_grouped_search
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timezone
@@ -46,7 +46,7 @@ def get_company_profile(company_name: str) -> str:
         articles = filter_by_embedding(
             articles,
             user_question=company_name,
-            top_k=12,
+            top_k=20,
             similarity_floor=0.25,
         )
 
@@ -64,7 +64,7 @@ def get_company_profile(company_name: str) -> str:
                     temperature=0.3,
                     messages=[
                         {"role": "system",
-                         "content": "Résume en 2 phrases maximum, français:"},
+                         "content": f"Résume cet article, garde les informations importante sur {company_name}, ainsi que les chiffres et dates "},
                         {"role": "user", "content": txt[:4000]}  # safety trim
                     ]
                 ).choices[0].message.content
@@ -76,7 +76,7 @@ def get_company_profile(company_name: str) -> str:
             temperature=0.2,
             messages=[
                 {"role": "system",
-                 "content": "Fusionne et dé-double les points:"},
+                 "content": f"Fusionne et dé-double les points, garde les informations importantes sur {company_name} et les informations chiffrés, si t'as deux chiffres pour le mêmes métric, tu mets les deux estimations."},
                 {"role": "user",
                  "content": "\n\n".join(chunk_summaries)}
             ]
@@ -103,7 +103,7 @@ def get_company_profile(company_name: str) -> str:
                     temperature=0.3,
                     messages=[
                         {"role": "system",
-                         "content": "organize ce texte, ce qui tintéresse c'est les informations sur l'entreprise, evenements, news, and contacts"},
+                         "content": f"organize ce texte, ce qui tintéresse c'est les informations sur {company_name}, evenements, news, and contacts, garde les chiffres et les dates"},
                         {"role": "user",
                          "content": (art.get('content') or art['snippet'])[:4000]}
                     ]
@@ -195,7 +195,7 @@ def get_company_profile(company_name: str) -> str:
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "developer", "content": "You are a company profile generators that helps my company 'atelierbox', specialist in corporate gifts, to gather information about companies, we offer mainly personnalized high quality products and textiles, giftboxes, onboarding boxes,ecommerce platforms for their clients or employees, and  everything related, you are professional, concise, and clear with proper organization here's an example of the output I want you to generate: "},
+            {"role": "developer", "content": "You are a company profile generators that helps my company 'atelierbox', specialist in corporate gifts, to gather information about companies, we offer mainly personnalized high quality products and textiles, giftboxes, onboarding boxes,ecommerce platforms for their clients or employees, and  everything related, you are professional, concise, and clear, you give actionable insights with numbers to prove it. "},
             {"role": "user",      "content": prompt}
         ]
     )
