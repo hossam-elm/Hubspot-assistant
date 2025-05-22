@@ -11,6 +11,8 @@ from httpx import ReadTimeout, HTTPStatusError
 from searchfuncs.searchgoogle import google_cse_search
 from sklearn.metrics.pairwise import cosine_similarity
 from utils.setup_log import logger
+from pathlib import Path
+from utils.sqlite_cache import SQLiteCache
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 MAX_CHUNK_WORDS = 200
 SIM_THRESHOLD   = 0.85
@@ -27,8 +29,7 @@ SEMANTIC_QUERIES = [
     "contact ou le nom d'une personne",
     "nom d'un événement",
     "informations CSE",
-    "informations sur agicap",
-    "événement ou webinar",
+    "événement",
     "event",
     "salon",
     "secteur ou chiffre d'affaires (CA)",
@@ -36,7 +37,13 @@ SEMANTIC_QUERIES = [
     "nombre de postes ouverts",
     "nombre de salariés",
     "bureaux ou siège social",
-]
+    "salariés",
+    'webinar',
+    "employés",
+    "collaborateurs",
+    "cse",
+    "rse"
+    ]
 
 # ─── DIRECTORIES ───────────────────────────────────────────────────────────
 CACHE_DIR = Path(".cache")
@@ -44,6 +51,9 @@ CACHE_DIR.mkdir(exist_ok=True)
 DB_PATH   = CACHE_DIR / "reports.db"
 
 client = OpenAI()
+# instantiate the two cache tables
+search_cache = SQLiteCache(DB_PATH, "search_cache")
+scrape_cache = SQLiteCache(DB_PATH, "scrape_cache")
 
 # ─── UTILS ─────────────────────────────────────────────────────────────────
 
@@ -219,72 +229,113 @@ def report(company_name: str, use_cache: bool = True, refresh_days: int = 7) -> 
                 all_chunks.append(item)
     conn.commit()
 
-    # ─── EMBEDDING & SEMANTIC FILTER ───────────────
-    report_semantic = []
-    current_threshold = SIM_THRESHOLD
-    min_threshold = 0.6
-    threshold_step = 0.05
+    # ─── EMBEDDING & SEMANTIC FILTER (per-query, batched, early-exit) ───────────────
+    # 1) Gather or compute all embeddings & build chunk_id → row-index map
+    all_embs: List[List[float]] = []
+    chunk_id_to_idx: Dict[int, int] = {}
+    next_idx = 0
 
-    text_list = []
-    reuse_embs = []
-    chunk_id_map = {}
-
+    # Reuse cached embeddings
     for item in all_chunks:
-        chunk_id = item["chunk_id"]
+        cid = item["chunk_id"]
         c.execute(
-            "SELECT embedding FROM chunks WHERE company = ? AND chunk_id = ?",
-            (company_name, chunk_id)
+            "SELECT embedding FROM chunks WHERE company=? AND chunk_id=?",
+            (company_name, cid)
         )
         row = c.fetchone()
         if row and row[0]:
-            reuse_embs.append(json.loads(row[0]))
-        else:
-            text_list.append(item["chunk"])
-            chunk_id_map[len(text_list) - 1] = chunk_id
+            emb = json.loads(row[0])
+            all_embs.append(emb)
+            chunk_id_to_idx[cid] = next_idx
+            next_idx += 1
 
-    new_embs = get_embeddings(text_list) if text_list else []
+    # Embed & store any new chunks
+    new_items = [it for it in all_chunks if it["chunk_id"] not in chunk_id_to_idx]
+    if new_items:
+        texts   = [it["chunk"] for it in new_items]
+        new_embs = get_embeddings(texts)
+        for item, emb in zip(new_items, new_embs):
+            cid = item["chunk_id"]
+            c.execute(
+                "UPDATE chunks SET embedding=? WHERE company=? AND chunk_id=?",
+                (json.dumps(emb), company_name, cid)
+            )
+            all_embs.append(emb)
+            chunk_id_to_idx[cid] = next_idx
+            next_idx += 1
+        conn.commit()
 
-    for idx, emb in enumerate(new_embs):
-        chunk_id = chunk_id_map[idx]
-        c.execute(
-            "UPDATE chunks SET embedding = ? WHERE company = ? AND chunk_id = ?",
-            (json.dumps(emb), company_name, chunk_id)
-        )
+    # 2) Pre-embed all queries once
+    query_embs = get_embeddings(SEMANTIC_QUERIES)
+    # Optionally define per-query thresholds here
+    per_query_threshold: Dict[str, float] = {
+        "événement": 0.75,
+        "event":     0.75,
+        "salon":     0.80,
+        # others default to SIM_THRESHOLD
+    }
+
+    # Clear any old labels
+    c.execute("UPDATE chunks SET matched_queries=NULL WHERE company=?", (company_name,))
     conn.commit()
 
-    all_embs = reuse_embs + new_embs
-    if all_embs:
-        query_embs = get_embeddings(SEMANTIC_QUERIES)
-        sims = cosine_similarity(all_embs, query_embs)
+    # 3) Score each query, batch updates, and early-exit when enough matches
+    total_matches = 0
+    max_matches   = 100
+    for q, qemb in zip(SEMANTIC_QUERIES, query_embs):
+        thr = per_query_threshold.get(q, SIM_THRESHOLD)
+        sims = cosine_similarity(all_embs, [qemb])[:, 0]
 
-        while True:
-            report_semantic = []
-            c.execute("UPDATE chunks SET matched_queries=NULL WHERE company=?", (company_name,))
+        updates = []
+        for cid, idx in chunk_id_to_idx.items():
+            if sims[idx] >= thr:
+                # fetch existing labels only once
+                c.execute(
+                    "SELECT matched_queries FROM chunks WHERE company=? AND chunk_id=?",
+                    (company_name, cid)
+                )
+                existing = c.fetchone()[0] or ""
+                labels = existing.split(",") if existing else []
+                if q not in labels:
+                    labels.append(q)
+                    updates.append((",".join(labels), company_name, cid))
+                    total_matches += 1
+
+        if updates:
+            c.executemany(
+                "UPDATE chunks SET matched_queries=? WHERE company=? AND chunk_id=?",
+                updates
+            )
             conn.commit()
 
-            for item, scores in zip(all_chunks, sims):
-                matched = [q for q, s in zip(SEMANTIC_QUERIES, scores) if s >= current_threshold]
-                if matched:
-                    report_semantic.append({**item, 'matched_queries': matched})
-                    c.execute(
-                        "UPDATE chunks SET matched_queries=? WHERE company=? AND chunk_id=?",
-                        (','.join(matched), company_name, item['chunk_id'])
-                    )
-            conn.commit()
+        # early exit if we have enough
+        if total_matches >= max_matches:
+            break
 
-            if len(report_semantic) >= 30 or current_threshold <= min_threshold:
-                break
-            else:
-                current_threshold -= threshold_step
-                current_threshold = max(current_threshold, min_threshold)
-                logger.info(f"Lowering threshold to {current_threshold:.2f} to find more semantic matches")
+    # 4) Rebuild semantic_items from the database
+    report_semantic = []
+    c.execute(
+        "SELECT chunk_id, link, title, chunk, matched_queries "
+        "FROM chunks WHERE company=? AND matched_queries IS NOT NULL",
+        (company_name,)
+    )
+    for chunk_id, link, title, chunk, matched in c.fetchall():
+        report_semantic.append({
+            "chunk_id": chunk_id,
+            "link": link,
+            "title": title,
+            "chunk": chunk,
+            "matched_queries": matched.split(",")
+        })
 
     conn.close()
 
-    logger.info("Report ready: %d semantic, %d linkedin segments",
-                len(report_semantic), len(linkedin_profile_chunks))
+    logger.info(
+        "Report ready: %d semantic items, %d linkedin segments",
+        len(report_semantic), len(linkedin_profile_chunks)
+    )
 
     return {
-        'semantic_items': report_semantic,
-        'linkedin_profiles': linkedin_profile_chunks
+        "semantic_items": report_semantic,
+        "linkedin_profiles": linkedin_profile_chunks
     }

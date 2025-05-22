@@ -8,19 +8,15 @@ Dependencies:
 
 from __future__ import annotations
 import asyncio
-import time
-import json
-import sqlite3
-import threading
 import logging
 from pathlib import Path
-from datetime import datetime, timezone
 from urllib.parse import urlparse
 from typing import List, Dict
 import requests
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 from trafilatura import extract
+from utils.sqlite_cache import SQLiteCache
 
 # ─── Logging Configuration ────────────────────────────────────────────────
 logging.basicConfig(
@@ -30,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Constants ───────────────────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent  
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR    = PROJECT_ROOT / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DB     = CACHE_DIR / "reports.db"
@@ -60,42 +56,8 @@ QUERY_TEMPLATES: List[str] = [
     "{name} site:linkedin.com/in intext:\"CSE\" OR \"Office manager\" OR \"Happiness\" OR \"Communication\" OR \"People\" OR \"Talent\" OR \"RH\"",
 ]
 
-# ─── SQLite Cache Abstraction (Thread-safe, WAL mode) ────────────────────
-class SQLiteCache:
-    def __init__(self, path: Path, table: str):
-        self.lock = threading.Lock()
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.table = table
-        self.conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table} (
-                key TEXT PRIMARY KEY,
-                js  TEXT,
-                ts  REAL
-            )
-        """)
-
-    def get(self, key: str):
-        with self.lock:
-            row = self.conn.execute(
-                f"SELECT js, ts FROM {self.table} WHERE key=?", (key,)
-            ).fetchone()
-        if row and time.time() - row[1] < CACHE_TTL_SECS:
-            return json.loads(row[0])
-        return None
-
-    def set(self, key: str, obj):
-        with self.lock:
-            self.conn.execute(
-                f"INSERT OR REPLACE INTO {self.table} (key, js, ts) VALUES (?, ?, ?)",
-                (key, json.dumps(obj), time.time())
-            )
-            self.conn.commit()
-
-# Instantiate caches
 search_cache = SQLiteCache(CACHE_DB, "search_cache")
 scrape_cache = SQLiteCache(CACHE_DB, "scrape_cache")
-
 # ─── HTTP Session & Async Client (Connection reuse) ───────────────────────
 session = requests.Session()
 session.headers.update(HEADERS)
