@@ -1,9 +1,9 @@
 '''
 search_helper.py
 Production-hardened Google CSE helper with unified caching in .cache/reports.db,
-scraping, and embeddings.
+scraping, and simplified results aggregation.
 Dependencies:
-    pip install requests httpx[http2] trafilatura sentence-transformers tenacity
+    pip install requests httpx[http2] trafilatura tenacity
 '''
 
 from __future__ import annotations
@@ -21,8 +21,6 @@ import requests
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 from trafilatura import extract
-from sentence_transformers import SentenceTransformer
-import hashlib
 
 # ─── Logging Configuration ────────────────────────────────────────────────
 logging.basicConfig(
@@ -50,16 +48,17 @@ BLOCKED_DOMAINS = {"linkedin.com"}
 QUERY_TEMPLATES: List[str] = [
     "{name} recrutement OR 'recrute' OR 'offres d’emploi' OR 'jobs'",
     "{name} 'nouveau bureau' OR 'ouvre un bureau' OR 'implantation' OR 'locaux'",
+    "{name} ('nouveau bureau 2025' OR 'nouveau bureau 2026') OR ('ouvre un bureau 2025' OR 'ouvre un bureau 2026') OR ('implantation 2025' OR 'implantation 2026') OR ('locaux 2025' OR 'locaux 2026')",
+    "{name} 'anniversaire' OR 'fondation' OR 'célèbre' OR 'event'",
     "{name} événement OR salon OR séminaire OR conférence OR webinaire'",
+    "{name} ('événement 2025' OR 'événement 2026') OR ('salon 2025' OR 'salon 2026') OR ('séminaire 2025' OR 'séminaire 2026') OR ('conférence 2025' OR 'conférence 2026') OR ('webinaire 2025' OR 'webinaire 2026')",
     "{name} 'rebranding' OR 'nouvelle identité' OR 'nouvelle charte graphique'",
+    "{name} ('rebranding 2025' OR 'rebranding 2026') OR ('nouvelle identité 2025' OR 'nouvelle identité 2026') OR ('nouvelle charte graphique 2025' OR 'nouvelle charte graphique 2026')",
     "{name} 'levée de fonds' OR 'tour de table' OR investissement OR financement'",
     "{name} actualités OR annonce OR nouveauté OR 'dernier communiqué'",
     "{name} chiffre d’affaires OR secteur OR clients OR 'cse'",
     "{name} site:linkedin.com/in intext:\"CSE\" OR \"Office manager\" OR \"Happiness\" OR \"Communication\" OR \"People\" OR \"Talent\" OR \"RH\"",
 ]
-
-# ─── Ensure folder & DB exist ─────────────────────────────────────────────
-CACHE_DB.parent.mkdir(parents=True, exist_ok=True)
 
 # ─── SQLite Cache Abstraction (Thread-safe, WAL mode) ────────────────────
 class SQLiteCache:
@@ -93,10 +92,9 @@ class SQLiteCache:
             )
             self.conn.commit()
 
-# Instantiate caches (all in the same DB file)
+# Instantiate caches
 search_cache = SQLiteCache(CACHE_DB, "search_cache")
 scrape_cache = SQLiteCache(CACHE_DB, "scrape_cache")
-embed_cache  = SQLiteCache(CACHE_DB, "embed_cache")
 
 # ─── HTTP Session & Async Client (Connection reuse) ───────────────────────
 session = requests.Session()
@@ -113,16 +111,6 @@ def get_async_client() -> httpx.AsyncClient:
 def _domain(url: str) -> str:
     host = urlparse(url).hostname or ""
     return host.lower().lstrip("www.")
-
-# ─── Embedding Utilities (Preloaded) ────────────────────────────────────
-_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-def embed_text(text: str) -> list[float]:
-    return _model.encode(text, convert_to_numpy=False).tolist()
-
-# ─── Stable Hash for Embedding Cache Keys ────────────────────────────────
-def stable_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 # ─── CSE Wrapper w/ Retries ───────────────────────────────────────────────
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
@@ -175,7 +163,7 @@ def run_queries(
                 })
     return final_items
 
-# ─── Scraping + Embedding ─────────────────────────────────────────────────
+# ─── Scraping Logic ───────────────────────────────────────────────────────
 async def _fetch(url: str, snippet: str) -> tuple[str, str]:
     cached = scrape_cache.get(url)
     if cached is not None:
@@ -201,14 +189,7 @@ async def _fetch(url: str, snippet: str) -> tuple[str, str]:
 
 async def scrape_urls(pairs: List[tuple[str, str]]) -> Dict[str, str]:
     results = await asyncio.gather(*(_fetch(u, s) for u, s in pairs))
-    out: Dict[str, str] = {}
-    for url, text in results:
-        out[url] = text
-        key = stable_hash(text)
-        if embed_cache.get(key) is None:
-            vec = embed_text(text)
-            embed_cache.set(key, vec)
-    return out
+    return {url: text for url, text in results}
 
 # ─── Public API ─────────────────────────────────────────────────────────────
 def google_cse_search(
@@ -219,16 +200,13 @@ def google_cse_search(
     recent_years: int | None = None,
     structured: bool = False,
 ) -> str | List[Dict]:
-    # 1. Query Google CSE
     items = run_queries(company_name, api_key, cx, num_results, recent_years)
-
-    # 2. Scrape content and cache embeddings
     pairs = [(it["link"], it.get("snippet", "")) for it in items]
     article_map = asyncio.run(scrape_urls(pairs))
 
     for it in items:
         it["content"] = article_map.get(it["link"])
-        # 2b. Drop any results that don't even mention the company name
+
     needle = company_name.lower()
     filtered = []
     for it in items:
@@ -237,20 +215,16 @@ def google_cse_search(
         snippet = (it.get("snippet") or "").lower()
         content = (it.get("content") or "").lower()
 
-        # Always keep LinkedIn pages
         if "linkedin.com" in link:
-            filtered.append(it)
-            continue
-
-        # Otherwise require at least one field to contain the company name
-        if (needle in title or
-            needle in snippet or
-            needle in link or
-            needle in content):
-            filtered.append(it)
+            # Keep LinkedIn only if company_name appears somewhere
+            if needle in link or needle in title or needle in snippet or needle in content:
+                filtered.append(it)
+        else:
+            if needle in title or needle in snippet or needle in link or needle in content:
+                filtered.append(it)
 
     items = filtered
-    # 3. Return structured or blob
+
     if structured:
         return items
 
