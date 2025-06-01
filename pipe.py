@@ -5,13 +5,18 @@ import time
 import sqlite3
 import datetime
 import logging
+import asyncio
+
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
-from httpx import ReadTimeout, HTTPStatusError
+from urllib.parse import urlparse
 
 import tiktoken
 from openai import OpenAI
 from sklearn.metrics.pairwise import cosine_similarity
+from httpx import AsyncClient, ReadTimeout, HTTPStatusError
+from trafilatura import extract as trafilatura_extract
+
 from searchfuncs.searchgoogle import google_cse_search
 from utils.setup_log import logger
 from utils.sqlite_cache import SQLiteCache
@@ -83,6 +88,7 @@ SEMANTIC_QUERIES = [
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
 DB_PATH = CACHE_DIR / "reports.db"
+QUERY_EMB_PATH = CACHE_DIR / "query_embs.json"
 
 # Initialize OpenAI client
 client = OpenAI()
@@ -91,13 +97,10 @@ client = OpenAI()
 search_cache = SQLiteCache(DB_PATH, "search_cache")
 scrape_cache = SQLiteCache(DB_PATH, "scrape_cache")
 
-
 # ─── LOGGING CONFIGURATION ──────────────────────────────────────────────────
 
-# Route all prints to logger
 logging.basicConfig(level=logging.INFO)
 logger.setLevel(logging.DEBUG)
-
 
 # ─── DATABASE INITIALIZATION ────────────────────────────────────────────────
 
@@ -140,7 +143,6 @@ def init_db() -> sqlite3.Connection:
     conn.commit()
     return conn
 
-
 # ─── UTILITY FUNCTIONS ───────────────────────────────────────────────────────
 
 def normalize_whitespace(text: str) -> str:
@@ -148,7 +150,6 @@ def normalize_whitespace(text: str) -> str:
     Replace any sequence of whitespace characters with a single space, and trim.
     """
     return re.sub(r"\s+", " ", text or "").strip()
-
 
 def chunk_text(text: str, max_words: int = MAX_CHUNK_WORDS) -> List[str]:
     """
@@ -169,7 +170,6 @@ def chunk_text(text: str, max_words: int = MAX_CHUNK_WORDS) -> List[str]:
         chunks.append(current.strip())
     return chunks
 
-
 def embed_clip_or_split(text: str, max_tokens: int = MAX_EMBED_TOKENS) -> List[str]:
     """
     If `text` fits within max_tokens after encoding, return [text].
@@ -188,19 +188,16 @@ def embed_clip_or_split(text: str, max_tokens: int = MAX_EMBED_TOKENS) -> List[s
         sub_texts.append(segment)
     return sub_texts
 
-
 def get_embeddings(texts: List[str]) -> List[List[float]]:
     """
     Request embeddings from OpenAI for the provided list of texts.
     - Splits texts further if they exceed max token length.
-    - Embeds chunks in order, but once the running total of tokens exceeds 100 000,
-      no further chunks are sent for embedding.
+    - Embeds all resulting sub-chunks, in batches of size BATCH_SIZE.
     - Retries up to MAX_RETRIES on read timeout or HTTP errors.
-    Returns a list of embeddings (one per chunk actually sent to the API).
+    Returns a list of embeddings (one per sub-chunk).
     """
     MAX_RETRIES = 3
     RETRY_BACKOFF = 2  # base seconds
-    MAX_TOTAL_TOKENS = 100_000
 
     if not texts:
         raise ValueError("No texts provided for embedding.")
@@ -217,32 +214,12 @@ def get_embeddings(texts: List[str]) -> List[List[float]]:
     if not safe_texts:
         return []
 
-    # 2) Build a list of sub-chunks to embed, stopping when token-sum > MAX_TOTAL_TOKENS
-    limited_texts: List[str] = []
-    total_tokens = 0
+    logger.debug(f"[DEBUG] Embedding {len(safe_texts)} total chunks")
 
-    for chunk in safe_texts:
-        chunk_tokens_len = len(ENC.encode(chunk))
-        # If adding this chunk would exceed 100k, stop here
-        if total_tokens + chunk_tokens_len > MAX_TOTAL_TOKENS:
-            logger.info(
-                f"[INFO] Reached token budget ({total_tokens} + {chunk_tokens_len} > {MAX_TOTAL_TOKENS}); "
-                "stopping further embeddings."
-            )
-            break
-
-        limited_texts.append(chunk)
-        total_tokens += chunk_tokens_len
-
-    if not limited_texts:
-        raise RuntimeError("No sub-chunks could be embedded within the 100 000-token limit.")
-
-    logger.debug(f"[DEBUG] Will embed {len(limited_texts)} chunks; total tokens = {total_tokens}")
-
-    # 3) Request embeddings in batches
+    # 2) Request embeddings in batches
     all_embs: List[List[float]] = []
-    for i in range(0, len(limited_texts), BATCH_SIZE):
-        batch = limited_texts[i : i + BATCH_SIZE]
+    for i in range(0, len(safe_texts), BATCH_SIZE):
+        batch = safe_texts[i : i + BATCH_SIZE]
         attempt = 0
         while attempt < MAX_RETRIES:
             try:
@@ -267,8 +244,6 @@ def get_embeddings(texts: List[str]) -> List[List[float]]:
     logger.debug(f"[DEBUG] Retrieved {len(all_embs)} embeddings")
     return all_embs
 
-
-
 def load_embedding(
     cursor: sqlite3.Cursor, company: str, chunk_id: int
 ) -> Optional[List[float]]:
@@ -288,7 +263,6 @@ def load_embedding(
     except json.JSONDecodeError:
         logger.warning(f"[WARN] Invalid embedding JSON for ({company}, {chunk_id})")
         return None
-
 
 def store_embedding(
     cursor: sqlite3.Cursor,
@@ -310,7 +284,6 @@ def store_embedding(
         (emb_json, company, chunk_id),
     )
 
-
 def clear_old_data(cursor: sqlite3.Cursor, company: str) -> None:
     """
     Delete all rows for a given company from chunks and chunk_labels.
@@ -318,21 +291,118 @@ def clear_old_data(cursor: sqlite3.Cursor, company: str) -> None:
     cursor.execute("DELETE FROM chunk_labels WHERE company = ?", (company,))
     cursor.execute("DELETE FROM chunks WHERE company = ?", (company,))
 
-
 def parse_linkedin_title(title: str) -> Dict[str, str]:
     """
-    Parse a LinkedIn title string of the form "Name - Title - Company" (2 or 3 parts).
+    Parse a LinkedIn title string of the form:
+      - "Name - Company"
+      - "Name - Job - Company"
+      - "Name - Senior Engineer - R&D - Corp" (or any number of middle segments)
     Returns a dict with keys: name, job, company.
     """
     parts = [p.strip() for p in title.split(" - ")]
+    if len(parts) == 1:
+        return {"name": parts[0], "job": "", "company": ""}
     if len(parts) == 2:
         name, company = parts
         return {"name": name, "job": "", "company": company}
-    if len(parts) == 3:
-        name, job, company = parts
-        return {"name": name, "job": job, "company": company}
-    return {"name": title, "job": "", "company": ""}
+    # len(parts) >= 3: first is name, last is company, middle parts form job
+    name = parts[0]
+    company = parts[-1]
+    job = " - ".join(parts[1:-1])
+    return {"name": name, "job": job, "company": company}
 
+
+# ─── ASYNC FETCH FOR SCRAPING ─────────────────────────────────────────────────
+
+def is_valid_url(u: str) -> bool:
+    parts = urlparse(u)
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
+
+async def async_robust_fetch(
+    client: AsyncClient,
+    url: str,
+    max_retries: int = 3,
+    backoff_factor: int = 2,
+    timeout: float = 10.0
+) -> Optional[str]:
+    """
+    Attempt to GET `url` with up to `max_retries` on ReadTimeout/HTTPStatusError.
+    Returns the response text if successful, or None if we give up.
+    """
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            resp = await client.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.text
+        except (ReadTimeout, HTTPStatusError):
+            attempt += 1
+            if attempt >= max_retries:
+                return None
+            wait = backoff_factor ** attempt
+            await asyncio.sleep(wait)
+        except Exception:
+            return None
+    return None
+
+async def fetch_all(
+    urls: List[str],
+    max_concurrency: int = 20
+) -> List[Tuple[str, Optional[str]]]:
+    """
+    Fetch each URL in `urls` concurrently (up to max_concurrency at a time).
+    Returns a list of (url, response_text_or_None).
+    """
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def sem_fetch(client: AsyncClient, url: str) -> Tuple[str, Optional[str]]:
+        async with semaphore:
+            if not is_valid_url(url):
+                return url, None
+            text = await async_robust_fetch(client, url)
+            return url, text
+
+    async with AsyncClient() as client:
+        tasks = [sem_fetch(client, url) for url in urls]
+        results = await asyncio.gather(*tasks)
+    return results
+
+# ─── CACHE/LOAD SEMANTIC QUERY EMBEDDINGS ────────────────────────────────────
+
+def _load_or_create_query_embeddings() -> List[List[float]]:
+    """
+    Load precomputed semantic-query embeddings from JSON if available and valid.
+    Otherwise, compute them once and save to disk.
+    """
+    if QUERY_EMB_PATH.exists():
+        try:
+            with open(QUERY_EMB_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if len(data) == len(SEMANTIC_QUERIES):
+                logger.info(f"[INIT] Loaded {len(data)} semantic-query embeddings from disk.")
+                return data
+            else:
+                logger.warning(f"[WARN] query_embs.json contains {len(data)} entries; expected {len(SEMANTIC_QUERIES)}.")
+        except Exception as e:
+            logger.warning(f"[WARN] Failed to read {QUERY_EMB_PATH}: {e}")
+
+    # Compute afresh
+    try:
+        embs = get_embeddings(SEMANTIC_QUERIES)
+        if len(embs) == len(SEMANTIC_QUERIES):
+            with open(QUERY_EMB_PATH, "w", encoding="utf-8") as f:
+                json.dump(embs, f)
+            logger.info(f"[INIT] Computed and saved {len(embs)} semantic-query embeddings.")
+            return embs
+        else:
+            logger.error(f"[ERROR] Expected {len(SEMANTIC_QUERIES)} query embeddings, got {len(embs)}.")
+            return embs
+    except Exception as e:
+        logger.error(f"[ERROR] Could not compute semantic-query embeddings: {e}")
+        return []
+
+# Precompute or load semantic-query embeddings once at import
+QUERY_EMBS: List[List[float]] = _load_or_create_query_embeddings()
 
 # ─── CACHE CHECK FUNCTIONS ───────────────────────────────────────────────────
 
@@ -410,20 +480,19 @@ def check_cache_and_return_if_fresh(
         "linkedin_profiles": linkedin_profiles,
     }
 
-
 # ─── RAW SCRAPE AND DB INSERTION ─────────────────────────────────────────────
 
 def fetch_and_store_raw_chunks(
     cursor: sqlite3.Cursor, company: str
 ) -> Tuple[List[Dict], List[Dict]]:
     """
-    Perform a Google CSE search for `company`, delete old cached rows, and insert new raw chunks.
-    Returns two lists:
+    Perform a Google CSE search for `company`, clear old rows for that company,
+    and insert new raw chunks into `chunks` table. Returns two lists:
       - all_chunks: list of dicts for non-LinkedIn content
-      - linkedin_chunks: list of dicts for LinkedIn segments to be returned separately
+      - linkedin_chunks: list of dicts for LinkedIn segments (parsed separately)
     Each dict has keys: chunk_id, link, title, chunk, is_linkedin (0 or 1)
     """
-    # Ensure environment variables are set
+    # 1) Run Google CSE search
     google_key = os.getenv("GOOGLE_KEY")
     google_cse_id = os.getenv("GOOGLE_CSE_ID")
     if not google_key or not google_cse_id:
@@ -437,46 +506,86 @@ def fetch_and_store_raw_chunks(
     )
     results = raw_results if isinstance(raw_results, (list, tuple)) else json.loads(raw_results)
 
-    # Clear old rows
+    # 2) Clear old rows for this company
     clear_old_data(cursor, company)
 
     all_chunks: List[Dict] = []
     linkedin_chunks: List[Dict] = []
     chunk_idx = 0
 
+    # 3) Collect URLs from CSE results, but skip LinkedIn in the fetch list
+    urls_to_visit: List[str] = []
+    snippets: Dict[str, str] = {}  # fallback snippet per URL
+
     for entry in results:
         link = normalize_whitespace(entry.get("link", ""))
         title = normalize_whitespace(entry.get("title", ""))
-        content = normalize_whitespace(entry.get("content") or entry.get("snippet", ""))
+        snippet = normalize_whitespace(entry.get("content") or entry.get("snippet", ""))
 
-        if not content:
+        if not link:
             continue
 
-        segments = chunk_text(content)
-        for seg in segments:
+        # If this is a LinkedIn profile, insert a chunk with is_linkedin=1 and skip fetch
+        if "linkedin.com/in" in link:
             chunk_idx += 1
-            is_li = 1 if "linkedin.com/in" in link else 0
-
             cursor.execute(
                 """
                 INSERT OR IGNORE INTO chunks
                   (company, chunk_id, link, title, chunk, is_linkedin, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, 1, NULL)
                 """,
-                (company, chunk_idx, link, title, seg, is_li)
+                (company, chunk_idx, link, title, snippet)
             )
-            item = {
+            parsed = parse_linkedin_title(title)
+            linkedin_chunks.append({
+                "chunk_id": chunk_idx,
+                "link": link,
+                "title": title,
+                "chunk": snippet,
+                **parsed
+            })
+            continue
+
+        # Otherwise, schedule this URL for async fetch
+        urls_to_visit.append(link)
+        snippets[link] = snippet
+
+    # 4) Fetch all non-LinkedIn pages asynchronously (max 20 concurrent)
+    fetch_results = asyncio.run(fetch_all(urls_to_visit, max_concurrency=20))
+
+    # 5) For each fetched (url, html_text), extract with Trafilatura or fallback to snippet
+    for url, html in fetch_results:
+        title = ""  # We don’t have a reliable <title> tag; optional
+        link = url
+
+        if html:
+            extracted = trafilatura_extract(html, url)
+            content = normalize_whitespace(extracted or "")
+        else:
+            content = snippets.get(url, "")
+
+        if not content:
+            continue
+
+        # Split into chunks and insert each with is_linkedin=0
+        segments = chunk_text(content)
+        for seg in segments:
+            chunk_idx += 1
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO chunks
+                  (company, chunk_id, link, title, chunk, is_linkedin, embedding)
+                VALUES (?, ?, ?, ?, ?, 0, NULL)
+                """,
+                (company, chunk_idx, link, title, seg)
+            )
+            all_chunks.append({
                 "chunk_id": chunk_idx,
                 "link": link,
                 "title": title,
                 "chunk": seg,
-                "is_linkedin": is_li,
-            }
-            if is_li:
-                parsed = parse_linkedin_title(title)
-                linkedin_chunks.append({**parsed, **item})
-            else:
-                all_chunks.append(item)
+                "is_linkedin": 0
+            })
 
     return all_chunks, linkedin_chunks
 
@@ -487,63 +596,132 @@ def ensure_embeddings(
     cursor: sqlite3.Cursor, company: str, all_chunks: List[Dict]
 ) -> Tuple[List[List[float]], Dict[int, int]]:
     """
-    For each chunk in all_chunks, attempt to reuse an existing embedding from the DB.
-    If none exists, collect those chunk texts, request embeddings, and store them.
+    For each chunk in all_chunks, reuse an existing embedding if it’s already in the DB.
+    Otherwise, collect those chunk texts up to a combined 100 000-token budget (after splitting),
+    embed each sub-chunk separately, average sub-chunk embeddings per chunk_id, and store.
+    Any chunks beyond that budget are deleted (so no chunk remains un-embedded).
     Returns:
-      - all_embs: list of all embeddings (existing + newly computed), in order of chunk_id_to_idx mapping
+      - all_embs: list of all embeddings (existing + newly computed), in order of chunk_id_to_idx
       - chunk_id_to_idx: dict mapping chunk_id -> index in all_embs
     """
     chunk_id_to_idx: Dict[int, int] = {}
     all_embs: List[List[float]] = []
     next_idx = 0
 
-    # Reuse cached embeddings where available
+    # 1) Reuse cached embeddings where available
     new_items: List[Dict] = []
-    new_texts: List[str] = []
-
     for item in all_chunks:
         cid = item["chunk_id"]
         existing_emb = load_embedding(cursor, company, cid)
-        if existing_emb:
+        if existing_emb is not None:
             chunk_id_to_idx[cid] = next_idx
             all_embs.append(existing_emb)
             next_idx += 1
         else:
             new_items.append(item)
-            new_texts.append(item["chunk"])
 
-    # Compute embeddings for chunks without one
-    if new_items:
-        new_embs = []
-        attempts = 0
-        while attempts < 3:
-            try:
-                logger.debug(f"[EMBED] Requesting embeddings for {len(new_texts)} chunks (attempt {attempts+1}).")
-                new_embs = get_embeddings(new_texts)
-                if len(new_embs) == len(new_items):
-                    break
-                logger.warning(f"[EMBED] Mismatch: expected {len(new_items)}, got {len(new_embs)}.")
-            except Exception as e:
-                logger.error(f"[EMBED] Error while embedding: {e}")
-            attempts += 1
-            time.sleep(2 ** attempts)
+    # If there are no “new” chunks, delete any leftover NULLs and return
+    if not new_items:
+        cursor.execute(
+            "DELETE FROM chunks WHERE company = ? AND embedding IS NULL",
+            (company,)
+        )
+        return all_embs, chunk_id_to_idx
 
-        if len(new_embs) != len(new_items):
-            logger.error(
-                f"[EMBED] After retries, embedding count mismatch: "
-                f"expected {len(new_items)}, got {len(new_embs)}."
+    # 2) Build a list of new chunk texts (with their chunk_ids),
+    #    but only up to 100 000 tokens total (counting sub-chunks).
+    MAX_TOTAL_TOKENS = 100_000
+    limited_items: List[Dict] = []
+    total_tokens = 0
+
+    for item in new_items:
+        text = item["chunk"]
+        sub_chunks = embed_clip_or_split(text)
+        if not sub_chunks:
+            continue  # skip empty or whitespace‐only
+
+        # Count tokens across all sub-chunks
+        chunk_token_count = sum(len(ENC.encode(sub)) for sub in sub_chunks)
+
+        if total_tokens + chunk_token_count > MAX_TOTAL_TOKENS:
+            logger.info(
+                f"[INFO] Reached 100 000-token budget: current={total_tokens}, "
+                f"next_chunk={chunk_token_count}.  Skipping remaining {len(new_items) - len(limited_items)} chunks."
             )
+            break
 
-        # Store new embeddings
-        for item, emb in zip(new_items, new_embs):
-            cid = item["chunk_id"]
-            store_embedding(cursor, company, cid, emb)
-            chunk_id_to_idx[cid] = next_idx
-            all_embs.append(emb)
-            next_idx += 1
+        limited_items.append(item)
+        total_tokens += chunk_token_count
+
+    # If none fit under 100k tokens, delete all un-embedded rows and return
+    if not limited_items:
+        logger.warning("[WARN] No new chunks fit under the 100 000-token limit; deleting all un-embedded rows.")
+        cursor.execute(
+            "DELETE FROM chunks WHERE company = ? AND embedding IS NULL",
+            (company,)
+        )
+        return all_embs, chunk_id_to_idx
+
+    logger.debug(f"[DEBUG] Preparing to embed {len(limited_items)} new chunks; total token-estimate = {total_tokens}")
+
+    # 3) Collect all sub-chunks for those limited_items, remembering mapping to chunk_id
+    texts_to_embed: List[str] = []
+    chunk_ids_for_embedding: List[int] = []
+    for item in limited_items:
+        cid = item["chunk_id"]
+        for sub in embed_clip_or_split(item["chunk"]):
+            texts_to_embed.append(sub)
+            chunk_ids_for_embedding.append(cid)
+
+    # 4) Send all sub-chunks to get_embeddings at once
+    try:
+        sub_embs = get_embeddings(texts_to_embed)
+    except Exception as e:
+        logger.error(f"[ERROR] Embedding failed for limited batch: {e}")
+        cursor.execute(
+            "DELETE FROM chunks WHERE company = ? AND embedding IS NULL",
+            (company,)
+        )
+        return all_embs, chunk_id_to_idx
+
+    if len(sub_embs) != len(texts_to_embed):
+        logger.warning(
+            f"[WARN] Expected {len(texts_to_embed)} sub-embeddings, but got {len(sub_embs)} back."
+        )
+
+    # 5) Average sub-chunk embeddings per chunk_id
+    emb_sums: Dict[int, List[float]] = {}
+    emb_counts: Dict[int, int] = {}
+
+    for cid, emb in zip(chunk_ids_for_embedding, sub_embs):
+        if cid not in emb_sums:
+            emb_sums[cid] = emb.copy()
+            emb_counts[cid] = 1
+        else:
+            # elementwise sum
+            for i in range(len(emb_sums[cid])):
+                emb_sums[cid][i] += emb[i]
+            emb_counts[cid] += 1
+
+    averaged_embs: Dict[int, List[float]] = {}
+    for cid, summed in emb_sums.items():
+        count = emb_counts[cid]
+        averaged_embs[cid] = [x / count for x in summed]
+
+    # 6) Store averaged embeddings for each chunk_id and update mappings
+    for cid, emb in averaged_embs.items():
+        store_embedding(cursor, company, cid, emb)
+        chunk_id_to_idx[cid] = next_idx
+        all_embs.append(emb)
+        next_idx += 1
+
+    # 7) Delete leftover rows with NULL embedding
+    cursor.execute(
+        "DELETE FROM chunks WHERE company = ? AND embedding IS NULL",
+        (company,)
+    )
 
     return all_embs, chunk_id_to_idx
-
 
 # ─── SEMANTIC MATCHING ───────────────────────────────────────────────────────
 
@@ -555,23 +733,17 @@ def compute_semantic_matches(
 ) -> List[Tuple[float, str, int]]:
     """
     Given all embeddings for a company's chunks and a mapping chunk_id->index,
-    compute cosine similarities against each semantic query embedding.
+    compute cosine similarities against precomputed semantic-query embeddings.
     Return a list of tuples (score, query, chunk_id) representing top matches,
     respecting per-query and global caps.
     """
     if not all_embs:
         return []
 
-    # Pre-embed queries
-    try:
-        query_embs = get_embeddings(SEMANTIC_QUERIES)
-    except Exception as e:
-        logger.error(f"[SEMANTIC] Failed to embed semantic queries: {e}")
-        return []
-
+    query_embs = QUERY_EMBS
     if len(query_embs) != len(SEMANTIC_QUERIES):
         logger.error(
-            f"[SEMANTIC] Query embedding count mismatch: "
+            f"[SEMANTIC] Precomputed query embedding count mismatch: "
             f"expected {len(SEMANTIC_QUERIES)}, got {len(query_embs)}"
         )
         return []
@@ -593,7 +765,6 @@ def compute_semantic_matches(
         logger.debug(f"[SEMANTIC] Query '{q}': starting threshold {current_thr}")
 
         while True:
-            # Collect candidates above current_thr that haven’t been seen for this (q, chunk_id)
             candidates = [
                 (sims[chunk_idx], q, cid)
                 for cid, chunk_idx in chunk_id_to_idx.items()
@@ -638,7 +809,6 @@ def compute_semantic_matches(
 
     logger.info(f"[SEMANTIC] Total semantic matches: {len(final_matches)}")
     return final_matches
-
 
 def write_and_read_matches(
     cursor: sqlite3.Cursor, company: str, matches: List[Tuple[float, str, int]]
@@ -690,7 +860,6 @@ def write_and_read_matches(
         })
     return semantic_items
 
-
 # ─── MAIN REPORT FUNCTION ────────────────────────────────────────────────────
 
 def report(company_name: str, use_cache: bool = True, refresh_days: int = 7) -> Dict[str, List[Dict]]:
@@ -698,7 +867,7 @@ def report(company_name: str, use_cache: bool = True, refresh_days: int = 7) -> 
     Generate a structured report for `company_name` by:
       1. Checking cache: if fresh and has labels, returns cached data.
       2. Otherwise:
-         a. Perform Google CSE search, chunk and store raw data.
+         a. Perform Google CSE search, fetch pages asynchronously, chunk and store raw data.
          b. Ensure embeddings exist for each chunk.
          c. Compute semantic matches & store new labels.
          d. Return semantic items and LinkedIn profiles.
@@ -715,17 +884,16 @@ def report(company_name: str, use_cache: bool = True, refresh_days: int = 7) -> 
             conn.close()
             return cached
 
-    # 2a) Fetch & store raw chunks
+    # 2a) Fetch & store raw chunks (with async fetching of HTML + Trafilatura extraction)
     all_chunks, linkedin_profiles = fetch_and_store_raw_chunks(cursor, company)
     conn.commit()
 
-    # 2b) Ensure embeddings
+    # 2b) Ensure embeddings (up to 100k tokens, average sub-chunks, delete leftovers)
     all_embs, chunk_id_to_idx = ensure_embeddings(cursor, company, all_chunks)
     conn.commit()
 
     if not all_embs:
         logger.warning(f"[REPORT] No embeddings generated for '{company}'. Returning LinkedIn only.")
-        # Load any LinkedIn profiles already stored
         conn.commit()
         conn.close()
         return {
