@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 from pipe import report
-from typing import Dict
+from typing import Dict, List
 import time
 from gspread.exceptions import APIError
 from utils.setup_log import logger
@@ -214,7 +214,7 @@ Entreprise à analyser : {company_name}
     }
 
 
-BATCH_SIZE = 10
+BATCH_SIZE = 5
 
 def batch_update_with_fallback(sheet, data):
     for attempt in range(5):
@@ -238,7 +238,7 @@ def fill_bd():
     names = sheet.col_values(3)
     existing_profiles = sheet.col_values(4)
 
-    updates = []
+    batch_updates: List[tuple[int, str]] = []
 
     for i, row in enumerate(records, start=2):
         company_name = names[i - 1] if i - 1 < len(names) else ""
@@ -251,30 +251,57 @@ def fill_bd():
         result = get_company_profile(company_name)
         if not result:
             continue
+
         linkedin_contacts = result.get('linkedin_contacts', '')
         if isinstance(linkedin_contacts, list):
             linkedin_contacts = "\n".join(linkedin_contacts)
-        combined = f"{result['profile']}\n\n👥 Interlocuteurs clés à contacter\n{linkedin_contacts}"
 
-        combined = str(combined).strip()
-        updates.append((i, combined))
-        logger.info(f"✅ Profile stored for {company_name}")
+        combined = f"{result['profile']}\n\n👥 Interlocuteurs clés à contacter\n{linkedin_contacts}".strip()
+        batch_updates.append((i, combined))
+        logger.info(f"✅ Profile ready for row {i} ({company_name})")
 
-    if not updates:
-        logger.info("✅ No new profiles to update.")
-        return
+        # As soon as we have 10 updates, send them in one batch
+        if len(batch_updates) >= BATCH_SIZE:
+            data = [
+                {'range': f'D{row_index}', 'values': [[text]]}
+                for row_index, text in batch_updates
+            ]
+            success = batch_update_with_fallback(sheet, data)
+            if success:
+                logger.info(f"✅ Batch of {len(batch_updates)} rows updated.")
+            else:
+                logger.error(f"⚠️ Batch update failed for rows {batch_updates[0][0]}–{batch_updates[-1][0]}. Trying individually.")
+                for row_index, text in batch_updates:
+                    for attempt in range(5):
+                        try:
+                            sheet.update(f'D{row_index}', [[text]])
+                            logger.info(f"✅ Updated row {row_index} individually.")
+                            break
+                        except APIError as e:
+                            err_str = str(e).lower()
+                            if "500" in err_str or "timeout" in err_str:
+                                wait_time = 2 ** attempt
+                                logger.warning(f"⚠️ API error on row {row_index} (attempt {attempt+1}) — retrying in {wait_time}s...")
+                                time.sleep(wait_time)
+                            else:
+                                logger.error(f"❌ Unrecoverable error on row {row_index}: {e}")
+                                break
 
-    # Process updates in batches for atomicity and partial update fallback
-    for batch_start in range(0, len(updates), BATCH_SIZE):
-        batch = updates[batch_start:batch_start + BATCH_SIZE]
-        data = [{'range': f'D{row_index}', 'values': [[text]]} for row_index, text in batch]
+            # Clear the batch list and continue
+            batch_updates.clear()
 
+    # After the loop, if any updates remain (< BATCH_SIZE), send them as a final batch
+    if batch_updates:
+        data = [
+            {'range': f'D{row_index}', 'values': [[text]]}
+            for row_index, text in batch_updates
+        ]
         success = batch_update_with_fallback(sheet, data)
-        logger.info(f"✅ Successfully updated {len(batch)} rows")
-        if not success:
-            # fallback to individual updates
-            logger.error(f"⚠️ Batch update failed for rows {batch_start + 2} to {batch_start + len(batch) + 1}. Trying individual updates.")
-            for row_index, text in batch:
+        if success:
+            logger.info(f"✅ Final batch of {len(batch_updates)} rows updated.")
+        else:
+            logger.error(f"⚠️ Final batch update failed for rows {batch_updates[0][0]}–{batch_updates[-1][0]}. Trying individually.")
+            for row_index, text in batch_updates:
                 for attempt in range(5):
                     try:
                         sheet.update(f'D{row_index}', [[text]])
@@ -284,11 +311,14 @@ def fill_bd():
                         err_str = str(e).lower()
                         if "500" in err_str or "timeout" in err_str:
                             wait_time = 2 ** attempt
-                            logger.error(f"⚠️ API error updating row {row_index} (attempt {attempt+1}) — retrying in {wait_time}s...")
+                            logger.warning(f"⚠️ API error on row {row_index} (attempt {attempt+1}) — retrying in {wait_time}s...")
                             time.sleep(wait_time)
                         else:
                             logger.error(f"❌ Unrecoverable error on row {row_index}: {e}")
                             break
+
+    logger.info("✅ All profiles processed and written.")
+
 
 if __name__ == "__main__":
     fill_bd()
