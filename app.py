@@ -8,6 +8,10 @@ from typing import Dict
 import time
 from gspread.exceptions import APIError
 from utils.setup_log import logger
+import tiktoken
+from collections import deque
+
+
 load_dotenv()
 
 # Keys
@@ -21,6 +25,43 @@ sheet_key = os.getenv('sheet_key')
 
 
 client = OpenAI()
+TPM_LIMIT = 200_000
+TOKEN_WINDOW_SECONDS = 60
+token_timestamps = deque()
+
+encoding = tiktoken.encoding_for_model("gpt-4o-mini")
+def count_tokens(text: str) -> int:
+    return len(encoding.encode(text))
+def throttle_if_needed(tokens_needed: int):
+    now = time.time()
+    # Remove tokens older than 60 seconds
+    while token_timestamps and now - token_timestamps[0][0] > TOKEN_WINDOW_SECONDS:
+        token_timestamps.popleft()
+
+    used_tokens = sum(t[1] for t in token_timestamps)
+
+    if used_tokens + tokens_needed > TPM_LIMIT:
+        wait_time = TOKEN_WINDOW_SECONDS - (now - token_timestamps[0][0])
+        logger.warning(f"⏳ Token limit reached. Waiting {int(wait_time)+1}s...")
+        time.sleep(wait_time + 1)
+
+    token_timestamps.append((time.time(), tokens_needed))
+
+def truncate_web_context(semantic_ctx, max_tokens=50000):
+    truncated_chunks = []
+    total_tokens = 0
+
+    for item in semantic_ctx:
+        chunk_text = f"• [{item['chunk_id']}] {item['chunk']} (↪ {item['link']})"
+        chunk_tokens = count_tokens(chunk_text)
+
+        if total_tokens + chunk_tokens > max_tokens:
+            # Stop adding more chunks when token limit is reached
+            break
+        truncated_chunks.append(chunk_text)
+        total_tokens += chunk_tokens
+
+    return "\n".join(truncated_chunks)
 
 def get_company_profile(company_name: str) -> Dict[str, str]:
     try:
@@ -34,10 +75,9 @@ def get_company_profile(company_name: str) -> Dict[str, str]:
 
     # Build semantic context for prompt
     if semantic_ctx:
-        web_context = "\n".join(
-            f"• [{it['chunk_id']}] {it['chunk']} (↪ {it['link']})"
-            for it in semantic_ctx
-        )
+        web_context = truncate_web_context(semantic_ctx, max_tokens=50000)
+        if not web_context.strip():
+            web_context = "Aucune information fiable trouvée."
     else:
         web_context = "Aucune information fiable trouvée."
     # 2) Dedupe linkedin_profiles by name or link
@@ -88,7 +128,7 @@ Utilise ce contexte web (extraits sémantiques) pour générer la fiche compte :
 🔹 Secteur & Modèle économique
 • Secteur d’activité (ex : FinTech, SaaS, Retail…)
 • Modèle économique (ex : abonnement B2B, marketplace…)
-• Date de création + age en 2025
+• Date de création ou si l'entreprise est le résultat de fusion tu donne cette date (format JJ/MM/YYYY, faut donner la date complète)  + age en 2025 + source
 
 👥 Taille de l’entreprise
 • Nombre de collaborateurs (total + France si dispo) si tu ne sais pas tu donne une estimation + source de l'info
@@ -148,7 +188,8 @@ En vous basant sur le potentiel de cette entreprise en matière de cadeaux d’e
 
 Entreprise à analyser : {company_name}
 """
-
+    input_tokens = count_tokens(prompt)
+    throttle_if_needed(input_tokens)
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.0,
@@ -160,7 +201,11 @@ Entreprise à analyser : {company_name}
             {"role": "user",      "content": prompt}
         ]
     )
+    
     profile_text = completion.choices[0].message.content
+    output_tokens = count_tokens(profile_text)
+    throttle_if_needed(output_tokens)
+    logger.info(f"🔢 Input tokens: {input_tokens}, Output tokens: {output_tokens}")
 
     # Return both the profile and the Linkedin contacts block
     return {
@@ -190,8 +235,8 @@ def batch_update_with_fallback(sheet, data):
 def fill_bd():
     sheet = get_google_sheet(SERVICE_ACCOUNT_FILE, sheet_key)
     records = sheet.get_all_records()
-    names = sheet.col_values(1)
-    existing_profiles = sheet.col_values(3)
+    names = sheet.col_values(3)
+    existing_profiles = sheet.col_values(4)
 
     updates = []
 
@@ -206,12 +251,12 @@ def fill_bd():
         result = get_company_profile(company_name)
         if not result:
             continue
+        linkedin_contacts = result.get('linkedin_contacts', '')
+        if isinstance(linkedin_contacts, list):
+            linkedin_contacts = "\n".join(linkedin_contacts)
+        combined = f"{result['profile']}\n\n👥 Interlocuteurs clés à contacter\n{linkedin_contacts}"
 
-        combined = (
-            f"{result['profile']}\n\n"
-            "👥 Interlocuteurs clés à contacter\n"
-            f"{result['linkedin_contacts']}"
-        )
+        combined = str(combined).strip()
         updates.append((i, combined))
         logger.info(f"✅ Profile stored for {company_name}")
 
@@ -222,7 +267,7 @@ def fill_bd():
     # Process updates in batches for atomicity and partial update fallback
     for batch_start in range(0, len(updates), BATCH_SIZE):
         batch = updates[batch_start:batch_start + BATCH_SIZE]
-        data = [{'range': f'C{row_index}', 'values': [[text]]} for row_index, text in batch]
+        data = [{'range': f'D{row_index}', 'values': [[text]]} for row_index, text in batch]
 
         success = batch_update_with_fallback(sheet, data)
         logger.info(f"✅ Successfully updated {len(batch)} rows")
@@ -232,7 +277,7 @@ def fill_bd():
             for row_index, text in batch:
                 for attempt in range(5):
                     try:
-                        sheet.update(f'C{row_index}', [[text]])
+                        sheet.update(f'D{row_index}', [[text]])
                         logger.info(f"✅ Updated row {row_index} individually.")
                         break
                     except APIError as e:

@@ -26,14 +26,15 @@ MAX_EMBED_TOKENS = 8190
 SEMANTIC_QUERIES = [
     "date ou référence temporelle",
     "données numériques ou statistiques",
-    "contact ou le nom d'une personne",
+    "fusion acquisition achats",
+    "anniversaire",
     "nom d'un événement",
     "informations CSE",
     "événement",
     "event",
     "salon",
     "secteur ou chiffre d'affaires (CA)",
-    "rebranding",
+    "rebranding identité visuelle",
     "nombre de postes ouverts",
     "nombre de salariés",
     "bureaux ou siège social",
@@ -42,7 +43,13 @@ SEMANTIC_QUERIES = [
     "employés",
     "collaborateurs",
     "cse",
-    "rse"
+    "rse",
+    "nombre d'emploés",
+    "bénéfices",
+    "turnover",
+    "certification ISO eco-vadis BCORP",
+    "taille de l'entreprise",
+    "valuation",
     ]
 
 # ─── DIRECTORIES ───────────────────────────────────────────────────────────
@@ -78,18 +85,30 @@ def chunk_text(text: str, max_words: int = MAX_CHUNK_WORDS) -> List[str]:
 
 # Split long texts into embedding-safe pieces:
 def embed_clip_or_split(text: str, max_tokens: int = MAX_EMBED_TOKENS) -> List[str]:
+    text = text.strip()
+    if not text:
+        return []  # skip empty inputs
     token_ids = ENC.encode(text)
     if len(token_ids) <= max_tokens:
         return [text]
     return [ENC.decode(token_ids[i:i+max_tokens]) for i in range(0, len(token_ids), max_tokens)]
 
+
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2  # seconds, multiplied by attempt count
 
 def get_embeddings(texts: List[str]) -> List[List[float]]:
+    print(f"[DEBUG] Received {len(texts)} original texts")
+    
     safe_texts: List[str] = []
     for txt in texts:
-        safe_texts.extend(embed_clip_or_split(txt))
+        chunks = embed_clip_or_split(txt)
+        if not chunks:
+            print(f"[WARN] Skipped input (empty or too short): '{txt[:60]}'")
+        safe_texts.extend(chunks)
+
+    print(f"[DEBUG] Total safe texts to embed: {len(safe_texts)}")
+    assert len(safe_texts) > 0, "No valid chunks produced; embedding skipped"
 
     all_embs: List[List[float]] = []
 
@@ -98,22 +117,26 @@ def get_embeddings(texts: List[str]) -> List[List[float]]:
         attempt = 0
         while attempt < MAX_RETRIES:
             try:
-                # Add a timeout (e.g., 30 seconds)
                 resp = client.embeddings.create(
                     model=EMBED_MODEL,
                     input=batch,
                     timeout=30
                 )
+                if not resp.data:
+                    print(f"[WARN] Empty embeddings returned for batch starting with: {batch[0][:60]}")
                 all_embs.extend(d.embedding for d in resp.data)
-                break  # success, exit retry loop
+                break
             except (ReadTimeout, HTTPStatusError) as e:
                 attempt += 1
                 if attempt >= MAX_RETRIES:
-                    raise  # re-raise after max attempts
+                    raise
                 wait_time = RETRY_BACKOFF ** attempt
-                print(f"Embedding request timeout/error, retry {attempt}/{MAX_RETRIES} after {wait_time}s...")
+                print(f"[ERROR] Embedding failed (retry {attempt}/{MAX_RETRIES}): {e}")
                 time.sleep(wait_time)
+
+    print(f"[DEBUG] Total embeddings returned: {len(all_embs)}")
     return all_embs
+
 
 
 
@@ -149,6 +172,7 @@ def parse_linkedin_title(title: str) -> Dict[str, str]:
 
 
 def report(company_name: str, use_cache: bool = True, refresh_days: int = 7) -> Dict[str, List[Dict]]:
+    logger.info(f"[DEBUG] report() called with company_name={company_name}")
     company_name = company_name.lower()
 
     conn = init_db()
@@ -160,29 +184,42 @@ def report(company_name: str, use_cache: bool = True, refresh_days: int = 7) -> 
         row = c.fetchone()
         if row and row[0]:
             last_updated = datetime.datetime.fromisoformat(row[0])
-            if (datetime.datetime.now() - last_updated).days < refresh_days:
-                logger.info(f"Using cached data for '{company_name}' (last updated {last_updated})")
+            recent_enough = (datetime.datetime.now() - last_updated).days < refresh_days
+
+            if recent_enough:
+                # Check for at least one matched query (semantic match)
                 c.execute("""
-                    SELECT chunk_id, link, title, chunk, matched_queries, is_linkedin 
-                    FROM chunks WHERE company=?""", (company_name,))
-                semantic_items = []
-                linkedin_profiles = []
+                    SELECT COUNT(*) FROM chunks 
+                    WHERE company=? AND matched_queries IS NOT NULL
+                """, (company_name,))
+                match_count = c.fetchone()[0]
 
-                for row in c.fetchall():
-                    chunk_id, link, title, chunk, matched, is_li = row
-                    item = {"chunk_id": chunk_id, "link": link, "title": title, "chunk": chunk}
-                    if is_li:
-                        parsed = parse_linkedin_title(title)
-                        linkedin_profiles.append({**parsed, **item})
-                    if matched:
-                        item['matched_queries'] = matched.split(",")
-                        semantic_items.append(item)
+                if match_count > 0:
+                    logger.info(f"Using cached data for '{company_name}' (last updated {last_updated})")
 
-                conn.close()
-                return {
-                    'semantic_items': semantic_items,
-                    'linkedin_profiles': linkedin_profiles
-                }
+                    c.execute("""
+                        SELECT chunk_id, link, title, chunk, matched_queries, is_linkedin 
+                        FROM chunks WHERE company=?""", (company_name,))
+                    semantic_items = []
+                    linkedin_profiles = []
+
+                    for row in c.fetchall():
+                        chunk_id, link, title, chunk, matched, is_li = row
+                        item = {"chunk_id": chunk_id, "link": link, "title": title, "chunk": chunk}
+                        if is_li:
+                            parsed = parse_linkedin_title(title)
+                            linkedin_profiles.append({**parsed, **item})
+                        if matched:
+                            item['matched_queries'] = matched.split(",")
+                            semantic_items.append(item)
+
+                    conn.close()
+                    return {
+                        'semantic_items': semantic_items,
+                        'linkedin_profiles': linkedin_profiles
+                    }
+                else:
+                    logger.warning(f"No semantic matches in cache for '{company_name}' — recrawling.")
 
     # ─── RECRAWL ───────────────────────────────────
     raw = google_cse_search(
@@ -229,11 +266,13 @@ def report(company_name: str, use_cache: bool = True, refresh_days: int = 7) -> 
                 all_chunks.append(item)
     conn.commit()
 
-    # ─── EMBEDDING & SEMANTIC FILTER (per-query, batched, early-exit) ───────────────
+
+    # ─── EMBEDDING & SEMANTIC FILTER ───────────────────────────────────────────
     # 1) Gather or compute all embeddings & build chunk_id → row-index map
     all_embs: List[List[float]] = []
     chunk_id_to_idx: Dict[int, int] = {}
     next_idx = 0
+    has_valid_embeddings = False
 
     # Reuse cached embeddings
     for item in all_chunks:
@@ -244,34 +283,101 @@ def report(company_name: str, use_cache: bool = True, refresh_days: int = 7) -> 
         )
         row = c.fetchone()
         if row and row[0]:
-            emb = json.loads(row[0])
-            all_embs.append(emb)
-            chunk_id_to_idx[cid] = next_idx
-            next_idx += 1
+            try:
+                emb = json.loads(row[0])
+                if emb:  # Verify it's not empty
+                    all_embs.append(emb)
+                    chunk_id_to_idx[cid] = next_idx
+                    next_idx += 1
+                    has_valid_embeddings = True
+                else:
+                    # Empty embedding, clear from DB
+                    logger.info(f"Clearing empty embedding for chunk {cid}")
+                    c.execute(
+                        "UPDATE chunks SET embedding=NULL WHERE company=? AND chunk_id=?",
+                        (company_name, cid)
+                    )
+                    conn.commit()
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid embedding JSON for chunk {cid}, clearing embedding")
+                c.execute(
+                    "UPDATE chunks SET embedding=NULL WHERE company=? AND chunk_id=?",
+                    (company_name, cid)
+                )
+                conn.commit()
 
     # Embed & store any new chunks
+    MAX_EMBED_RETRIES = 3
     new_items = [it for it in all_chunks if it["chunk_id"] not in chunk_id_to_idx]
+
     if new_items:
-        texts   = [it["chunk"] for it in new_items]
-        new_embs = get_embeddings(texts)
-        for item, emb in zip(new_items, new_embs):
-            cid = item["chunk_id"]
-            c.execute(
-                "UPDATE chunks SET embedding=? WHERE company=? AND chunk_id=?",
-                (json.dumps(emb), company_name, cid)
+        texts = [it["chunk"] for it in new_items]
+        new_embs = []
+        attempt = 0
+
+        while attempt < MAX_EMBED_RETRIES:
+            print("[DEBUG] About to call get_embeddings()")
+            new_embs = get_embeddings(texts)
+            print("[DEBUG] Returned from get_embeddings()")
+            if len(new_embs) == len(new_items):
+                break  # Success, embeddings count matches chunks
+            attempt += 1
+            logger.warning(f"Embedding retry {attempt}/{MAX_EMBED_RETRIES} for {len(new_items)} chunks")
+            time.sleep(2 ** attempt)  # Exponential backoff before retry
+
+        if len(new_embs) != len(new_items):
+            logger.error(
+                f"Embedding count mismatch after retries: expected {len(new_items)} "
+                f"but got {len(new_embs)}"
             )
-            all_embs.append(emb)
-            chunk_id_to_idx[cid] = next_idx
-            next_idx += 1
+
+        for item, emb in zip(new_items, new_embs):
+            if emb:  # Only store non-empty embeddings
+                cid = item["chunk_id"]
+                c.execute(
+                    "UPDATE chunks SET embedding=? WHERE company=? AND chunk_id=?",
+                    (json.dumps(emb), company_name, cid)
+                )
+                all_embs.append(emb)
+                chunk_id_to_idx[cid] = next_idx
+                next_idx += 1
+                has_valid_embeddings = True
+
         conn.commit()
+
+    # Final verification
+    if not has_valid_embeddings:
+        logger.warning(f"No valid embeddings found for company '{company_name}'")
+        return {
+            'semantic_items': [],
+            'linkedin_profiles': linkedin_profile_chunks
+        }
+
+    logger.debug(f"Total embeddings collected: {len(all_embs)}")
+    logger.debug(f"Chunk ID mapping: {chunk_id_to_idx}")
 
     # 2) Pre-embed all queries once
     query_embs = get_embeddings(SEMANTIC_QUERIES)
+    if len(query_embs) != len(SEMANTIC_QUERIES):
+        raise RuntimeError(
+            f"[ERROR] Expected {len(SEMANTIC_QUERIES)} query embeddings, "
+            f"but got {len(query_embs)} — possible embedding failure."
+        )
     # Optionally define per-query thresholds here
     per_query_threshold: Dict[str, float] = {
         "événement": 0.75,
-        "event":     0.75,
-        "salon":     0.80,
+        "event": 0.75,
+        "salon": 0.75,
+        "secteur ou chiffre d'affaires (CA)": 0.75,
+        "rebranding": 0.75,
+        "nombre de postes ouverts": 0.75,
+        "nombre de salariés": 0.75,
+        "salariés": 0.75,
+        'webinar': 0.75,
+        "employés": 0.75,
+        "collaborateurs": 0.75,
+        "cse": 0.75,
+        "nombre d'emploés":0.75,
         # others default to SIM_THRESHOLD
     }
 
@@ -280,37 +386,119 @@ def report(company_name: str, use_cache: bool = True, refresh_days: int = 7) -> 
     conn.commit()
 
     # 3) Score each query, batch updates, and early-exit when enough matches
-    total_matches = 0
-    max_matches   = 100
+    MAX_MATCHES_PER_QUERY = 6
+    MAX_TOTAL_MATCHES = 100
+    MIN_SIM_THRESHOLD = 0.2  # Don't lower below this
+
+    top_matches_by_query = {}
+    all_candidates = []
+    seen_pairs = set()
+    # At the start of the semantic matching section (before the loop)
+    if not all_embs:
+        logger.warning(f"No embeddings found for company '{company_name}' - skipping semantic matching")
+        return {
+            'semantic_items': [],
+            'linkedin_profiles': linkedin_profile_chunks
+        }
+
+    if len(query_embs) != len(SEMANTIC_QUERIES):
+        logger.error(
+            f"Embedding count mismatch: expected {len(SEMANTIC_QUERIES)} "
+            f"but got {len(query_embs)} - skipping semantic matching"
+        )
+        return {
+            'semantic_items': [],
+            'linkedin_profiles': linkedin_profile_chunks
+        }
+    logger.info("Starting semantic match selection for %d queries", len(SEMANTIC_QUERIES))
+
     for q, qemb in zip(SEMANTIC_QUERIES, query_embs):
         thr = per_query_threshold.get(q, SIM_THRESHOLD)
         sims = cosine_similarity(all_embs, [qemb])[:, 0]
+        
+        matches = []
+        step = 0.02
+        current_thr = thr
+        attempts = 0
 
-        updates = []
-        for cid, idx in chunk_id_to_idx.items():
-            if sims[idx] >= thr:
-                # fetch existing labels only once
-                c.execute(
-                    "SELECT matched_queries FROM chunks WHERE company=? AND chunk_id=?",
-                    (company_name, cid)
-                )
-                existing = c.fetchone()[0] or ""
-                labels = existing.split(",") if existing else []
-                if q not in labels:
-                    labels.append(q)
-                    updates.append((",".join(labels), company_name, cid))
-                    total_matches += 1
+        logger.info("Query '%s': initial threshold = %.2f", q, current_thr)
 
-        if updates:
-            c.executemany(
-                "UPDATE chunks SET matched_queries=? WHERE company=? AND chunk_id=?",
-                updates
-            )
-            conn.commit()
+        while len(matches) < MAX_MATCHES_PER_QUERY and current_thr >= MIN_SIM_THRESHOLD:
+            last_thr_used = current_thr
+            matches = [
+                (sims[idx], q, cid)
+                for cid, idx in chunk_id_to_idx.items()
+                if sims[idx] >= current_thr and (q, cid) not in seen_pairs
+            ]
+            matches.sort(reverse=True)
+            if len(matches) >= MAX_MATCHES_PER_QUERY:
+                matches = matches[:MAX_MATCHES_PER_QUERY]
+                break
+            current_thr -= step
+            attempts += 1
 
-        # early exit if we have enough
-        if total_matches >= max_matches:
-            break
+        logger.info("Query '%s': found %d matches after %d attempts (final threshold = %.2f)", 
+                    q, len(matches), attempts, last_thr_used)
+
+        top_matches_by_query[q] = matches
+        seen_pairs.update((q, cid) for _, q, cid in matches)
+
+        # Collect remaining candidates above minimum threshold
+        extras = [
+            (sims[idx], q, cid)
+            for cid, idx in chunk_id_to_idx.items()
+            if sims[idx] >= MIN_SIM_THRESHOLD and (q, cid) not in seen_pairs
+        ]
+        all_candidates.extend(extras)
+
+    # Combine matches from all queries
+    final_matches = []
+    for matches in top_matches_by_query.values():
+        final_matches.extend(matches)
+
+    logger.info("Initial total matches from top queries: %d", len(final_matches))
+
+    # Global fill if under 100
+    if len(final_matches) < MAX_TOTAL_MATCHES:
+        remaining_needed = MAX_TOTAL_MATCHES - len(final_matches)
+        logger.info("Filling remaining %d matches from global leftovers", remaining_needed)
+
+        all_candidates.sort(reverse=True)
+        for score, q, cid in all_candidates:
+            if (q, cid) not in seen_pairs:
+                final_matches.append((score, q, cid))
+                seen_pairs.add((q, cid))
+                if len(final_matches) >= MAX_TOTAL_MATCHES:
+                    break
+
+    logger.info("Final match count: %d", len(final_matches))
+
+    # DB updates
+    updates_by_chunk = {}
+    for _, q, cid in final_matches:
+        c.execute(
+            "SELECT matched_queries FROM chunks WHERE company=? AND chunk_id=?",
+            (company_name, cid)
+        )
+        existing = c.fetchone()[0] or ""
+        labels = existing.split(",") if existing else []
+
+        if q not in labels:
+            labels.append(q)
+            updates_by_chunk[cid] = ",".join(labels)
+
+    updates = [(labels, company_name, cid) for cid, labels in updates_by_chunk.items()]
+    if updates:
+        logger.info("Writing %d chunk updates to database", len(updates))
+        c.executemany(
+            "UPDATE chunks SET matched_queries=? WHERE company=? AND chunk_id=?",
+            updates
+        )
+        conn.commit()
+    else:
+        logger.info("No new updates to write.")
+
+
 
     # 4) Rebuild semantic_items from the database
     report_semantic = []
