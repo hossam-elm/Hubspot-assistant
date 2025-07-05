@@ -229,7 +229,13 @@ async def scrape_urls(pairs: List[tuple[str, str]]) -> Dict[str, str]:
     # Log summary counts (only if any nonzero)
     summary_parts = [f"{cat}={cnt}" for cat, cnt in counts.items() if cnt > 0]
     if summary_parts:
-        logger.warning("Scrape summary: " + ", ".join(summary_parts))
+        total_scraped = sum(counts.values())
+        success_rate = (counts["trafilatura"] / total_scraped * 100) if total_scraped > 0 else 0
+        logger.info(f"Scraped {total_scraped} URLs: {success_rate:.1f}% success rate")
+        if counts["blocked"] > 0:
+            logger.debug(f"Blocked domains: {counts['blocked']}")
+        if counts["exception"] > 0:
+            logger.debug(f"Network errors: {counts['exception']}")
 
     return article_map
 
@@ -245,24 +251,23 @@ def google_cse_search(
     Perform Google CSE queries, scrape returned URLs for full text, filter by any word in company_name,
     then return either a structured list of dicts or a formatted string.
     """
-    logger.debug(f"[CSE SEARCH] Starting search for '{company_name}' "
-                 f"(num_results={num_results}, recent_years={recent_years}, structured={structured})")
+    logger.info(f"Starting Google CSE search for '{company_name}'")
 
     # 1) Run the templated queries and gather raw hits
     items = run_queries(company_name, api_key, cx, num_results, recent_years)
-    logger.debug(f"[CSE SEARCH] run_queries returned {len(items)} raw items")
+    logger.debug(f"Found {len(items)} search results")
 
     # 2) Build (url, snippet) pairs and scrape each URL for full content
     pairs = [(it["link"], it.get("snippet", "")) for it in items]
-    logger.debug(f"[CSE SEARCH] Created {len(pairs)} (url, snippet) pairs for scraping")
+    logger.debug(f"Preparing to scrape {len(pairs)} URLs")
 
     try:
         article_map = asyncio.run(scrape_urls(pairs))
     except Exception as e:
-        logger.error(f"[CSE SEARCH] Error during scraping: {e}", exc_info=True)
+        logger.error(f"Error during scraping: {e}")
         article_map = {}
 
-    logger.debug(f"[CSE SEARCH] scrape_urls returned content for {len(article_map)} URLs")
+    logger.debug(f"Successfully scraped {len(article_map)} URLs")
 
     # 3) Attach scraped content (or None if scraping failed) to each item
     for it in items:
@@ -271,7 +276,7 @@ def google_cse_search(
 
     # 4) Filter items based on any word in company_name appearing anywhere
     words = [w.lower() for w in company_name.split() if w.strip()]
-    logger.debug(f"[CSE SEARCH] Filtering by keywords: {words}")
+    logger.debug(f"Filtering by keywords: {words}")
 
     filtered: List[Dict] = []
     for it in items:
@@ -284,13 +289,13 @@ def google_cse_search(
         if any(word in link or word in title or word in snippet or word in content for word in words):
             filtered.append(it)
 
-    logger.debug(f"[CSE SEARCH] Filtered down to {len(filtered)} items after matching any keyword")
+    logger.info(f"Found {len(filtered)} relevant results after filtering")
 
     items = filtered  # override with filtered results
 
     # 5) Return structured results or formatted string
     if structured:
-        logger.debug(f"[CSE SEARCH] Returning structured list of {len(items)} items")
+        logger.debug(f"Returning structured list of {len(items)} items")
         return items
 
     formatted = [
@@ -298,5 +303,5 @@ def google_cse_search(
         for it in items
     ]
     result_str = "\n\n".join(formatted)
-    logger.debug(f"[CSE SEARCH] Returning formatted string with {len(items)} entries")
+    logger.debug(f"Returning formatted string with {len(items)} entries")
     return result_str

@@ -99,8 +99,7 @@ scrape_cache = SQLiteCache(DB_PATH, "scrape_cache")
 
 # ─── LOGGING CONFIGURATION ──────────────────────────────────────────────────
 
-logging.basicConfig(level=logging.INFO)
-logger.setLevel(logging.DEBUG)
+# Logger is already configured in utils/setup_log.py
 
 # ─── DATABASE INITIALIZATION ────────────────────────────────────────────────
 
@@ -207,14 +206,14 @@ def get_embeddings(texts: List[str]) -> List[List[float]]:
     for txt in texts:
         sub_chunks = embed_clip_or_split(txt)
         if not sub_chunks:
-            logger.warning("[WARN] Skipped empty or whitespace-only text.")
+            logger.warning("Skipped empty or whitespace-only text")
             continue
         safe_texts.extend(sub_chunks)
 
     if not safe_texts:
         return []
 
-    logger.debug(f"[DEBUG] Embedding {len(safe_texts)} total chunks")
+    logger.debug(f"Embedding {len(safe_texts)} total chunks")
 
     # 2) Request embeddings in batches
     all_embs: List[List[float]] = []
@@ -229,19 +228,19 @@ def get_embeddings(texts: List[str]) -> List[List[float]]:
                     timeout=30
                 )
                 if not resp.data:
-                    logger.warning(f"[WARN] Received empty embeddings for batch idx {i}.")
+                    logger.warning(f"Received empty embeddings for batch {i}")
                 all_embs.extend(d.embedding for d in resp.data)
                 break
             except (ReadTimeout, HTTPStatusError) as e:
                 attempt += 1
                 if attempt >= MAX_RETRIES:
-                    logger.error(f"[ERROR] Embedding failed after {MAX_RETRIES} attempts: {e}")
+                    logger.error(f"Embedding failed after {MAX_RETRIES} attempts: {e}")
                     raise
                 wait_time = RETRY_BACKOFF ** attempt
-                logger.warning(f"[WARN] Embedding retry {attempt}/{MAX_RETRIES} after {wait_time}s: {e}")
+                logger.warning(f"Embedding retry {attempt}/{MAX_RETRIES} after {wait_time}s: {e}")
                 time.sleep(wait_time)
 
-    logger.debug(f"[DEBUG] Retrieved {len(all_embs)} embeddings")
+    logger.debug(f"Retrieved {len(all_embs)} embeddings")
     return all_embs
 
 def load_embedding(
@@ -261,7 +260,7 @@ def load_embedding(
     try:
         return json.loads(row[0])
     except json.JSONDecodeError:
-        logger.warning(f"[WARN] Invalid embedding JSON for ({company}, {chunk_id})")
+        logger.warning(f"Invalid embedding JSON for {company}, chunk {chunk_id}")
         return None
 
 def store_embedding(
@@ -379,12 +378,12 @@ def _load_or_create_query_embeddings() -> List[List[float]]:
             with open(QUERY_EMB_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if len(data) == len(SEMANTIC_QUERIES):
-                logger.info(f"[INIT] Loaded {len(data)} semantic-query embeddings from disk.")
+                logger.info(f"Loaded {len(data)} semantic-query embeddings from disk")
                 return data
             else:
-                logger.warning(f"[WARN] query_embs.json contains {len(data)} entries; expected {len(SEMANTIC_QUERIES)}.")
+                logger.warning(f"query_embs.json contains {len(data)} entries, expected {len(SEMANTIC_QUERIES)}")
         except Exception as e:
-            logger.warning(f"[WARN] Failed to read {QUERY_EMB_PATH}: {e}")
+            logger.warning(f"Failed to read {QUERY_EMB_PATH}: {e}")
 
     # Compute afresh
     try:
@@ -392,13 +391,13 @@ def _load_or_create_query_embeddings() -> List[List[float]]:
         if len(embs) == len(SEMANTIC_QUERIES):
             with open(QUERY_EMB_PATH, "w", encoding="utf-8") as f:
                 json.dump(embs, f)
-            logger.info(f"[INIT] Computed and saved {len(embs)} semantic-query embeddings.")
+            logger.info(f"Computed and saved {len(embs)} semantic-query embeddings")
             return embs
         else:
-            logger.error(f"[ERROR] Expected {len(SEMANTIC_QUERIES)} query embeddings, got {len(embs)}.")
+            logger.error(f"Expected {len(SEMANTIC_QUERIES)} query embeddings, got {len(embs)}")
             return embs
     except Exception as e:
-        logger.error(f"[ERROR] Could not compute semantic-query embeddings: {e}")
+        logger.error(f"Could not compute semantic-query embeddings: {e}")
         return []
 
 # Precompute or load semantic-query embeddings once at import
@@ -424,7 +423,7 @@ def check_cache_and_return_if_fresh(
     last_updated = datetime.datetime.fromisoformat(row[0])
     age_days = (datetime.datetime.now() - last_updated).days
     if age_days >= refresh_days:
-        logger.info(f"[CACHE] Cached data for '{company}' is older than {refresh_days} days ({age_days} days).")
+        logger.info(f"Cached data for '{company}' is {age_days} days old (older than {refresh_days} days)")
         return None
 
     # Ensure at least one semantic label exists
@@ -433,7 +432,7 @@ def check_cache_and_return_if_fresh(
     )
     match_count = cursor.fetchone()[0]
     if match_count == 0:
-        logger.info(f"[CACHE] No semantic labels found for '{company}', recrawl needed.")
+        logger.info(f"No semantic labels found for '{company}', recrawl needed")
         return None
 
     # Load semantic items
@@ -474,7 +473,7 @@ def check_cache_and_return_if_fresh(
             **parsed
         })
 
-    logger.info(f"[CACHE] Returning cached report for '{company}' (last updated {last_updated}).")
+    logger.info(f"Returning cached report for '{company}' (updated {last_updated.strftime('%Y-%m-%d %H:%M')})")
     return {
         "semantic_items": semantic_items,
         "linkedin_profiles": linkedin_profiles,
@@ -645,8 +644,8 @@ def ensure_embeddings(
 
         if total_tokens + chunk_token_count > MAX_TOTAL_TOKENS:
             logger.info(
-                f"[INFO] Reached 100 000-token budget: current={total_tokens}, "
-                f"next_chunk={chunk_token_count}.  Skipping remaining {len(new_items) - len(limited_items)} chunks."
+                f"Reached 100k token budget: current={total_tokens}, "
+                f"next_chunk={chunk_token_count}. Skipping remaining {len(new_items) - len(limited_items)} chunks"
             )
             break
 
@@ -655,14 +654,14 @@ def ensure_embeddings(
 
     # If none fit under 100k tokens, delete all un-embedded rows and return
     if not limited_items:
-        logger.warning("[WARN] No new chunks fit under the 100 000-token limit; deleting all un-embedded rows.")
+        logger.warning("No new chunks fit under the 100k token limit; deleting all un-embedded rows")
         cursor.execute(
             "DELETE FROM chunks WHERE company = ? AND embedding IS NULL",
             (company,)
         )
         return all_embs, chunk_id_to_idx
 
-    logger.debug(f"[DEBUG] Preparing to embed {len(limited_items)} new chunks; total token-estimate = {total_tokens}")
+    logger.debug(f"Preparing to embed {len(limited_items)} new chunks; total token-estimate = {total_tokens}")
 
     # 3) Collect all sub-chunks for those limited_items, remembering mapping to chunk_id
     texts_to_embed: List[str] = []
@@ -677,7 +676,7 @@ def ensure_embeddings(
     try:
         sub_embs = get_embeddings(texts_to_embed)
     except Exception as e:
-        logger.error(f"[ERROR] Embedding failed for limited batch: {e}")
+        logger.error(f"Embedding failed for limited batch: {e}")
         cursor.execute(
             "DELETE FROM chunks WHERE company = ? AND embedding IS NULL",
             (company,)
@@ -686,7 +685,7 @@ def ensure_embeddings(
 
     if len(sub_embs) != len(texts_to_embed):
         logger.warning(
-            f"[WARN] Expected {len(texts_to_embed)} sub-embeddings, but got {len(sub_embs)} back."
+            f"Expected {len(texts_to_embed)} sub-embeddings, but got {len(sub_embs)} back"
         )
 
     # 5) Average sub-chunk embeddings per chunk_id
@@ -743,7 +742,7 @@ def compute_semantic_matches(
     query_embs = QUERY_EMBS
     if len(query_embs) != len(SEMANTIC_QUERIES):
         logger.error(
-            f"[SEMANTIC] Precomputed query embedding count mismatch: "
+            f"Precomputed query embedding count mismatch: "
             f"expected {len(SEMANTIC_QUERIES)}, got {len(query_embs)}"
         )
         return []
@@ -762,7 +761,7 @@ def compute_semantic_matches(
         matches: List[Tuple[float, str, int]] = []
         current_thr = thr
 
-        logger.debug(f"[SEMANTIC] Query '{q}': starting threshold {current_thr}")
+        logger.debug(f"Query '{q}': starting threshold {current_thr}")
 
         while True:
             candidates = [
@@ -777,7 +776,7 @@ def compute_semantic_matches(
             current_thr -= THRESHOLD_STEP
 
         logger.debug(
-            f"[SEMANTIC] Query '{q}': found {len(matches)} matches at threshold {current_thr}"
+            f"Query '{q}': found {len(matches)} matches at threshold {current_thr}"
         )
 
         top_matches_by_query[q] = matches
@@ -807,7 +806,7 @@ def compute_semantic_matches(
                 if len(final_matches) >= MAX_TOTAL_MATCHES:
                     break
 
-    logger.info(f"[SEMANTIC] Total semantic matches: {len(final_matches)}")
+    logger.info(f"Total semantic matches: {len(final_matches)}")
     return final_matches
 
 def write_and_read_matches(
@@ -893,7 +892,7 @@ def report(company_name: str, use_cache: bool = True, refresh_days: int = 7) -> 
     conn.commit()
 
     if not all_embs:
-        logger.warning(f"[REPORT] No embeddings generated for '{company}'. Returning LinkedIn only.")
+        logger.warning(f"No embeddings generated for '{company}'. Returning LinkedIn only")
         conn.commit()
         conn.close()
         return {

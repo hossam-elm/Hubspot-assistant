@@ -235,10 +235,27 @@ def batch_update_with_fallback(sheet, data):
 def fill_bd():
     sheet = get_google_sheet(SERVICE_ACCOUNT_FILE, sheet_key)
     records = sheet.get_all_records()
-    names = sheet.col_values(3)
-    existing_profiles = sheet.col_values(4)
+    names = sheet.col_values(2)
+    existing_profiles = sheet.col_values(3)
+
+    logger.info(f"📋 Found {len(records)} total rows in sheet")
+    
+    # Count companies that need processing
+    companies_to_process = 0
+    for i, row in enumerate(records, start=2):
+        company_name = names[i - 1] if i - 1 < len(names) else ""
+        current_note = existing_profiles[i - 1] if i - 1 < len(existing_profiles) else ""
+        if company_name.strip() and not current_note.strip():
+            companies_to_process += 1
+    
+    logger.info(f"🎯 Found {companies_to_process} companies that need profiles generated")
+    
+    if companies_to_process == 0:
+        logger.info("✅ All companies already have profiles - nothing to do!")
+        return
 
     batch_updates: List[tuple[int, str]] = []
+    processed_count = 0
 
     for i, row in enumerate(records, start=2):
         company_name = names[i - 1] if i - 1 < len(names) else ""
@@ -250,6 +267,7 @@ def fill_bd():
         logger.info(f"🔍 Generating profile for: {company_name}")
         result = get_company_profile(company_name)
         if not result:
+            logger.warning(f"⚠️ Failed to generate profile for: {company_name}")
             continue
 
         linkedin_contacts = result.get('linkedin_contacts', '')
@@ -258,12 +276,13 @@ def fill_bd():
 
         combined = f"{result['profile']}\n\n👥 Interlocuteurs clés à contacter\n{linkedin_contacts}".strip()
         batch_updates.append((i, combined))
-        logger.info(f"✅ Profile ready for row {i} ({company_name})")
+        processed_count += 1
+        logger.info(f"✅ Profile ready for row {i} ({company_name}) - {processed_count}/{companies_to_process} completed")
 
         # As soon as we have 10 updates, send them in one batch
         if len(batch_updates) >= BATCH_SIZE:
             data = [
-                {'range': f'D{row_index}', 'values': [[text]]}
+                {'range': f'C{row_index}', 'values': [[text]]}
                 for row_index, text in batch_updates
             ]
             success = batch_update_with_fallback(sheet, data)
@@ -274,7 +293,7 @@ def fill_bd():
                 for row_index, text in batch_updates:
                     for attempt in range(5):
                         try:
-                            sheet.update(f'D{row_index}', [[text]])
+                            sheet.update(values=[[text]], range_name=f'C{row_index}')
                             logger.info(f"✅ Updated row {row_index} individually.")
                             break
                         except APIError as e:
@@ -293,7 +312,7 @@ def fill_bd():
     # After the loop, if any updates remain (< BATCH_SIZE), send them as a final batch
     if batch_updates:
         data = [
-            {'range': f'D{row_index}', 'values': [[text]]}
+            {'range': f'C{row_index}', 'values': [[text]]}
             for row_index, text in batch_updates
         ]
         success = batch_update_with_fallback(sheet, data)
@@ -304,7 +323,7 @@ def fill_bd():
             for row_index, text in batch_updates:
                 for attempt in range(5):
                     try:
-                        sheet.update(f'D{row_index}', [[text]])
+                        sheet.update(values=[[text]], range_name=f'C{row_index}')
                         logger.info(f"✅ Updated row {row_index} individually.")
                         break
                     except APIError as e:
@@ -321,4 +340,13 @@ def fill_bd():
 
 
 if __name__ == "__main__":
-    fill_bd()
+    logger.info("🚀 Starting HubSpot Assistant - Company Profile Generator")
+    logger.info(f"📊 Processing Google Sheet: {sheet_key}")
+    logger.info(f"🔑 Using OpenAI model: gpt-4o-mini")
+    
+    try:
+        fill_bd()
+        logger.info("🎉 HubSpot Assistant completed successfully!")
+    except Exception as e:
+        logger.error(f"💥 HubSpot Assistant failed: {e}")
+        raise
