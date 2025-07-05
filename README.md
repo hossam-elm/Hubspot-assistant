@@ -1,4 +1,4 @@
-# HubSpot Assistant 🤖
+# AI-Powered B2B Lead Intelligence Tool 🤖
 
 > AI-powered company profiling tool that automatically researches companies and generates sales-ready lead intelligence.
 
@@ -21,7 +21,7 @@ Built for **Atelier Box** (corporate gifts company) to quickly understand prospe
 - **SQLite** for intelligent caching
 - **httpx** for fast async web scraping
 - **trafilatura** for clean content extraction
-- **scikit-learn** **text-embedding-ada-002** for semantic matching
+- **scikit-learn** & **text-embedding-ada-002** for semantic matching
 - **Google Sheets API** for data export
 
 ## Quick Start
